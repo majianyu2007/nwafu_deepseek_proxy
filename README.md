@@ -8,11 +8,11 @@
 
 1. 启动时自动完成 CAS 认证（包括 AES 密码加密、表单提交、ticket 兑换）
 2. 获取到目标站点的有效 session cookie
-3. 在本地暴露 `http://localhost:8000/v1` 端点
+3. 在本地暴露 `http://localhost:8000/v1` 全能 API 端点（chat / embeddings / rerank / models）
 4. 所有经过代理的请求会自动附带 CAS cookie + Open WebUI API Key
 5. 后台定时保活，cookie 过期时无感刷新
 
-你只需要把 API 地址指向 `localhost:8000/v1`，就能在 Chatbox、LobeChat 等第三方客户端中正常使用学校的模型了。
+你只需要把 API 地址指向 `localhost:8000/v1`，就能在 Chatbox、LobeChat 等第三方客户端中正常使用学校的模型了。支持对话补全、向量嵌入、文档重排序等全部主流 API 接口。
 
 ## 快速开始
 
@@ -87,6 +87,35 @@ python test_api.py
 python test_api.py Qwen3-235B-A22B
 ```
 
+### 支持的 API 端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/v1/models` | GET | 查看全部可用模型 |
+| `/v1/chat/completions` | POST | 对话补全（支持流式） |
+| `/v1/embeddings` | POST | 向量嵌入 |
+| `/v1/rerank` | POST | 文档重排序（Jina / Cohere 兼容） |
+
+#### Rerank API 用法
+
+```bash
+curl http://localhost:8000/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "什么是机器学习",
+    "documents": [
+      "机器学习是人工智能的一个分支",
+      "今天天气不错",
+      "深度学习是机器学习的子集"
+    ],
+    "top_n": 2
+  }'
+```
+
+- `model` 可留空，代理会自动选择上游可用的 rerank 模型
+- `documents` 支持字符串数组或 `{"text": "..."}` 格式
+- 如果上游无原生 rerank 接口，会自动回退到 embeddings 余弦相似度排序
+
 ## 客户端配置
 
 在你使用的 LLM 客户端中：
@@ -110,6 +139,9 @@ python test_api.py Qwen3-235B-A22B
 ```
 第三方客户端 (Chatbox / LobeChat / curl / ...)
         │
+        │  /v1/chat/completions  (对话)
+        │  /v1/embeddings        (嵌入)
+        │  /v1/rerank            (重排序)
         ▼
 localhost:8000  ← 本地 FastAPI 代理
         │
@@ -119,7 +151,7 @@ localhost:8000  ← 本地 FastAPI 代理
 deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
         │
         ▼
-    后端大模型 (DeepSeek / Qwen / ...)
+    后端大模型 (DeepSeek / Qwen / Reranker / ...)
 ```
 
 ### 认证流程细节

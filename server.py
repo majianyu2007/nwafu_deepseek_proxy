@@ -3,6 +3,7 @@ nwafu_deepseek_proxy - 校园统一认证 Open WebUI 代理
 
 自动处理金智教育 (Wisedu) AuthServer CAS 认证流程,
 在本地暴露 OpenAI 兼容的 API 端点, 供第三方客户端直接调用。
+支持 chat / completions / embeddings / rerank 等全部 OpenAI 兼容接口。
 
 详见 README.md
 """
@@ -16,7 +17,7 @@ import random
 import sys
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, quote
 
 import httpx
@@ -26,7 +27,8 @@ from Crypto.Util.Padding import pad
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 import uvicorn
 
 # ============================================================
@@ -419,6 +421,8 @@ async def root():
             "api_base": f"http://localhost:{PROXY_PORT}/v1",
             "models_endpoint": f"http://localhost:{PROXY_PORT}/v1/models",
             "chat_endpoint": f"http://localhost:{PROXY_PORT}/v1/chat/completions",
+            "embeddings_endpoint": f"http://localhost:{PROXY_PORT}/v1/embeddings",
+            "rerank_endpoint": f"http://localhost:{PROXY_PORT}/v1/rerank",
         },
     }
 
@@ -600,6 +604,341 @@ def _is_auth_redirect(resp: httpx.Response) -> bool:
 
 
 # ============================================================
+# Rerank 模型支持 —— Jina / Cohere 兼容的 /v1/rerank 端点
+# ============================================================
+
+
+class RerankRequest(BaseModel):
+    """标准 Jina / Cohere 兼容的 rerank 请求体"""
+    model: str = Field(default="", description="Rerank 模型 ID, 留空则自动选择")
+    query: str = Field(..., description="查询文本")
+    documents: List[Any] = Field(..., description="待排序的文档列表 (字符串或字典)")
+    top_n: Optional[int] = Field(default=None, description="返回前 N 个结果")
+    return_documents: Optional[bool] = Field(default=True, description="是否在结果中包含文档内容")
+
+
+class RerankResult(BaseModel):
+    index: int
+    relevance_score: float
+    document: Optional[Dict[str, str]] = None
+
+
+class RerankResponse(BaseModel):
+    id: str = ""
+    results: List[RerankResult] = []
+    meta: Optional[Dict[str, Any]] = None
+
+
+# 缓存已发现的 rerank 模型 ID
+_rerank_model_cache: List[str] = []
+_rerank_cache_time: float = 0
+_RERANK_CACHE_TTL: float = 300  # 5 分钟缓存
+
+
+async def _discover_rerank_models() -> List[str]:
+    """从上游 /v1/models 自动发现 rerank 模型"""
+    global _rerank_model_cache, _rerank_cache_time
+
+    now = time.time()
+    if _rerank_model_cache and (now - _rerank_cache_time) < _RERANK_CACHE_TTL:
+        return _rerank_model_cache
+
+    try:
+        client = await session_mgr.ensure_login()
+        headers = {"Host": TARGET_HOST}
+        if OPENWEBUI_API_KEY:
+            headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+
+        resp = await client.get(
+            f"{TARGET_BASE}/v1/models",
+            headers=headers,
+            follow_redirects=False,
+        )
+
+        if resp.status_code == 200:
+            models = resp.json().get("data", [])
+            rerank_ids = [
+                m["id"] for m in models
+                if "rerank" in m.get("id", "").lower()
+            ]
+            _rerank_model_cache = rerank_ids
+            _rerank_cache_time = now
+            if rerank_ids:
+                logger.info(f"🔍 发现 {len(rerank_ids)} 个 rerank 模型: {rerank_ids}")
+            else:
+                logger.warning("⚠️  未发现 rerank 模型")
+            return rerank_ids
+    except Exception as e:
+        logger.error(f"❌ 查询 rerank 模型失败: {e}")
+
+    return _rerank_model_cache
+
+
+def _extract_document_text(doc: Any) -> str:
+    """从文档中提取纯文本 (支持字符串和 {text: ...} 格式)"""
+    if isinstance(doc, str):
+        return doc
+    if isinstance(doc, dict):
+        return doc.get("text", str(doc))
+    return str(doc)
+
+
+async def _rerank_via_upstream_api(
+    client: httpx.AsyncClient,
+    model: str,
+    query: str,
+    documents: List[str],
+    top_n: Optional[int],
+) -> tuple[Optional[List[dict]], str]:
+    """
+    策略 1: 直接转发到上游的 /api/v1/retrieval/rerank
+    (Open WebUI 内部 RAG 接口, 部分版本可能可用)
+    """
+    headers = {"Host": TARGET_HOST, "Content-Type": "application/json"}
+    if OPENWEBUI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+
+    # 尝试 Jina/Cohere 标准格式的上游端点
+    for endpoint in ["/v1/rerank", "/api/v1/retrieval/rerank"]:
+        try:
+            payload = {
+                "model": model,
+                "query": query,
+                "documents": documents,
+            }
+            if top_n is not None:
+                payload["top_n"] = top_n
+
+            resp = await client.post(
+                f"{TARGET_BASE}{endpoint}",
+                headers=headers,
+                json=payload,
+                follow_redirects=False,
+            )
+
+            if _is_auth_redirect(resp):
+                logger.debug(f"  → {endpoint} 被认证拦截")
+                continue
+
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("results", data.get("data", []))
+                if results:
+                    logger.info(f"  ✅ 上游 {endpoint} 返回 {len(results)} 条结果")
+                    return results, model
+
+            logger.debug(f"  → {endpoint} 返回 {resp.status_code}, 尝试下一个端点")
+
+        except Exception as e:
+            logger.debug(f"  → {endpoint} 调用异常: {e}")
+            continue
+
+    return None, model
+
+
+async def _rerank_via_embeddings(
+    client: httpx.AsyncClient,
+    model: str,
+    query: str,
+    documents: List[str],
+    top_n: Optional[int],
+) -> tuple[Optional[List[dict]], str]:
+    """
+    策略 2: 使用 embeddings API 计算余弦相似度进行 rerank
+    将 query 和 documents 一起发送给 embeddings API, 然后计算相似度
+    """
+    headers = {"Host": TARGET_HOST, "Content-Type": "application/json"}
+    if OPENWEBUI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+
+    try:
+        # 找一个 embedding 模型
+        resp = await client.get(
+            f"{TARGET_BASE}/v1/models",
+            headers={"Host": TARGET_HOST, **({
+                "Authorization": f"Bearer {OPENWEBUI_API_KEY}"
+            } if OPENWEBUI_API_KEY else {})},
+            follow_redirects=False,
+        )
+
+        embed_model = None
+        if resp.status_code == 200:
+            models = resp.json().get("data", [])
+            for m in models:
+                mid = m.get("id", "").lower()
+                is_embedding = any(kw in mid for kw in ["embed", "bge-m", "m3", "nomic", "minilm"])
+                if is_embedding and "rerank" not in mid:
+                    embed_model = m["id"]
+                    break
+
+        if not embed_model:
+            logger.warning("⚠️  未找到 embedding 模型, 无法使用 embeddings 回退策略")
+            return None, model
+
+        # 将 query + documents 合并成一次 embedding 调用
+        all_texts = [query] + documents
+        resp = await client.post(
+            f"{TARGET_BASE}/v1/embeddings",
+            headers=headers,
+            json={"model": embed_model, "input": all_texts},
+            follow_redirects=False,
+        )
+
+        if resp.status_code != 200:
+            logger.warning(f"⚠️  embeddings API 返回 {resp.status_code}")
+            return None, model
+
+        emb_data = resp.json().get("data", [])
+        if len(emb_data) < 2:
+            return None, model
+
+        # 按 index 排序确保顺序正确
+        emb_data.sort(key=lambda x: x.get("index", 0))
+        query_vec = emb_data[0]["embedding"]
+        doc_vecs = [d["embedding"] for d in emb_data[1:]]
+
+        # 计算余弦相似度
+        import math
+
+        def cosine_sim(a, b):
+            dot = sum(x * y for x, y in zip(a, b))
+            norm_a = math.sqrt(sum(x * x for x in a))
+            norm_b = math.sqrt(sum(x * x for x in b))
+            if norm_a == 0 or norm_b == 0:
+                return 0.0
+            return dot / (norm_a * norm_b)
+
+        scores = []
+        for i, doc_vec in enumerate(doc_vecs):
+            score = cosine_sim(query_vec, doc_vec)
+            # 归一化到 [0, 1] 范围 (余弦相似度范围为 [-1, 1])
+            normalized_score = (score + 1.0) / 2.0
+            scores.append({"index": i, "relevance_score": round(normalized_score, 6)})
+
+        # 按分数降序排列
+        scores.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+        if top_n is not None:
+            scores = scores[:top_n]
+
+        logger.info(f"  ✅ embeddings 回退: 使用 {embed_model} 计算了 {len(scores)} 条相似度")
+        return scores, embed_model
+
+    except Exception as e:
+        logger.error(f"❌ embeddings 回退失败: {e}")
+        return None, model
+
+
+@app.post("/v1/rerank")
+async def rerank(request: Request):
+    """
+    Jina / Cohere 兼容的 Rerank API 端点
+
+    请求格式:
+    {
+        "model": "bge-reranker-v2-m3",  // 可选, 留空自动选择
+        "query": "搜索内容",
+        "documents": ["文档1", "文档2", ...],
+        "top_n": 3,                      // 可选
+        "return_documents": true          // 可选
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "无效的 JSON 请求体"},
+        )
+
+    try:
+        req = RerankRequest(**body)
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"请求参数错误: {e}"},
+        )
+
+    if not req.documents:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "documents 不能为空"},
+        )
+
+    # 提取文档纯文本
+    doc_texts = [_extract_document_text(d) for d in req.documents]
+
+    # 确定使用的模型
+    model = req.model
+    if not model:
+        available = await _discover_rerank_models()
+        if available:
+            model = available[0]
+            logger.info(f"🎯 自动选择 rerank 模型: {model}")
+        else:
+            model = ""  # 留空, 让回退策略处理
+
+    logger.info(
+        f"📊 Rerank 请求: model={model}, query={req.query[:50]}..., "
+        f"docs={len(doc_texts)}, top_n={req.top_n}"
+    )
+
+    max_retries = 2
+    for attempt in range(max_retries):
+        client = await session_mgr.ensure_login()
+
+        actual_model_used = model
+        
+        # 策略 1: 尝试上游 rerank API
+        results, actual_model_used = await _rerank_via_upstream_api(
+            client, model, req.query, doc_texts, req.top_n
+        )
+
+        # 策略 2: embeddings 回退
+        if results is None:
+            logger.info("  ℹ️  上游 rerank 不可用, 尝试 embeddings 回退...")
+            results, actual_model_used = await _rerank_via_embeddings(
+                client, model, req.query, doc_texts, req.top_n
+            )
+
+        if results is not None:
+            # 构造标准响应
+            response_results = []
+            for r in results:
+                item = RerankResult(
+                    index=r["index"],
+                    relevance_score=r["relevance_score"],
+                )
+                if req.return_documents:
+                    idx = r["index"]
+                    if 0 <= idx < len(doc_texts):
+                        item.document = {"text": doc_texts[idx]}
+                response_results.append(item)
+
+            resp = RerankResponse(
+                id=f"rerank-{int(time.time())}",
+                results=response_results,
+                meta={
+                    "model": actual_model_used,
+                    "query": req.query,
+                    "total_docs": len(doc_texts),
+                },
+            )
+
+            return JSONResponse(content=resp.model_dump())
+
+        # 如果两个策略都失败, 尝试重新登录
+        if attempt < max_retries - 1:
+            logger.warning("🔄 rerank 请求失败, 尝试重新登录...")
+            await session_mgr.force_relogin()
+
+    return JSONResponse(
+        status_code=502,
+        content={"error": "Rerank 请求失败: 上游 API 不可用且无可用回退策略"},
+    )
+
+
+# ============================================================
 # 注册代理路由
 # ============================================================
 
@@ -638,6 +977,12 @@ if __name__ == "__main__":
   AuthServer:  {AUTH_SERVER}
   User:        {USERNAME}
   WebUI Key:   {api_key_hint}
+  {'=' * 40}
+  支持端点:
+    - /v1/chat/completions  (对话)
+    - /v1/embeddings        (向量嵌入)
+    - /v1/rerank            (重排序)
+    - /v1/models            (模型列表)
   {'=' * 40}
   客户端配置: API URL = http://localhost:{PROXY_PORT}/v1, API Key = 任意值
 """)
