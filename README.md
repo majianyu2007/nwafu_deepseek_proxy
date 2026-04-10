@@ -18,7 +18,7 @@
 
 ### 环境要求
 
-- Python 3.9+
+- Python 3.9+（或 Docker）
 - 校园网环境（或 VPN）
 
 ### 安装
@@ -52,7 +52,24 @@ cp .env.example .env
 python server.py
 ```
 
-启动后控制台会打印出代理地址和认证状态。
+### Docker 部署
+
+如果不想配置 Python 环境，也可以用 Docker：
+
+```bash
+cp .env.example .env
+# 编辑 .env 填入学号、密码、API Key
+
+docker compose up -d
+```
+
+停止：
+
+```bash
+docker compose down
+```
+
+启动后代理同样监听在 `localhost:8000`，行为与直接运行完全一致。
 
 ### 验证
 
