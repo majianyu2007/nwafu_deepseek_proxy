@@ -48,6 +48,7 @@ python test_api.py Qwen3-235B-A22B  # Specific model
 
 **Entry points:**
 - `server.py` - Main FastAPI application (~550 lines, pure transparent proxy)
+- `GET /` - 轻量聊天界面（模型选择 + 流式对话，调用 `/v1/*`）
 - `list_models.py` - Model listing utility
 - `test_api.py` - End-to-end connectivity test
 

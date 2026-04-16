@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>NWAFU DeepSeek Proxy</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+:root{
+  --bg:#000;--fg:#c0c0c0;--dim:#555;--accent:#0f0;--accent2:#0cc;
+  --bar:#0a0a0a;--border:#222;--input-bg:#0a0a0a;
+  --user-bg:#001a00;--user-border:#0a0;
+  --ai-bg:#0a0a0a;--ai-border:#066;
+  --pre-bg:#050505;--pre-border:#1a1a1a;
+  --btn-bg:#111;--btn-border:#333;--btn-hover:#1a1a1a;
+  --err:#f44;--err-bg:#1a0000;
+}
+@media(prefers-color-scheme:light){
+:root{
+  --bg:#fff;--fg:#222;--dim:#999;--accent:#070;--accent2:#088;
+  --bar:#fafafa;--border:#ddd;--input-bg:#fff;
+  --user-bg:#f0fff0;--user-border:#0a0;
+  --ai-bg:#f8f8f8;--ai-border:#088;
+  --pre-bg:#f0f0f0;--pre-border:#ddd;
+  --btn-bg:#eee;--btn-border:#ccc;--btn-hover:#e0e0e0;
+  --err:#c00;--err-bg:#fff5f5;
+}
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column;font-size:13px}
+#toolbar{display:flex;align-items:center;gap:8px;padding:5px 12px;background:var(--bar);border-bottom:1px solid var(--border);flex-wrap:wrap}
+#toolbar .brand{color:var(--accent);font-weight:700;margin-right:auto;font-size:13px}
+#toolbar .brand::before{content:"$ ";color:var(--dim)}
+#toolbar select,#toolbar button{font:inherit;font-size:12px;padding:2px 8px;background:var(--btn-bg);color:var(--fg);border:1px solid var(--btn-border);cursor:pointer}
+#toolbar button:hover{background:var(--btn-hover);color:var(--accent)}
+#status{font-size:11px;color:var(--dim)}
+#chatbox{flex:1;overflow-y:auto;padding:8px 12px;display:flex;flex-direction:column;gap:2px}
+.m{padding:4px 0;font-size:13px;line-height:1.65;word-break:break-word}
+.m .role{color:var(--dim);font-size:11px;user-select:none}
+.m.user .role{color:var(--accent)}
+.m.user .role::before{content:"> "}
+.m.assistant .role{color:var(--accent2)}
+.m.assistant .role::before{content:"$ "}
+.m .body{padding:4px 0 4px 16px;border-left:1px solid var(--border)}
+.m.user .body{border-color:var(--user-border);white-space:pre-wrap}
+.m.assistant .body{border-color:var(--ai-border)}
+.m.assistant pre{background:var(--pre-bg);border:1px solid var(--pre-border);padding:8px;overflow-x:auto;margin:6px 0}
+.m.assistant code{font-size:12px}
+.m.assistant p{margin:3px 0}
+.m.err .body{color:var(--err);border-color:var(--err)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+.cursor{color:var(--accent);animation:blink .7s step-end infinite;font-weight:700}
+#inputbar{display:flex;gap:8px;padding:5px 12px;background:var(--bar);border-top:1px solid var(--border);align-items:flex-end}
+#prompt{flex:1;font:inherit;font-size:13px;padding:5px 8px;background:var(--input-bg);color:var(--fg);border:1px solid var(--border);resize:none;min-height:36px;max-height:120px}
+#prompt:focus{outline:none;border-color:var(--accent)}
+#inputbar button{font:inherit;font-size:12px;padding:4px 12px;background:var(--btn-bg);color:var(--fg);border:1px solid var(--btn-border);cursor:pointer;white-space:nowrap}
+#inputbar button:hover{background:var(--btn-hover);color:var(--accent)}
+#inputbar button:disabled{opacity:.35;cursor:not-allowed}
+#inputbar button:disabled:hover{color:var(--fg);background:var(--btn-bg)}
+#stopBtn{color:var(--err);border-color:var(--err)}
+#stopBtn:hover{background:var(--err-bg)}
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <span class="brand">nwafu-proxy</span>
+  <select id="modelSelect"><option>loading…</option></select>
+  <button onclick="loadModels()">reload</button>
+  <button onclick="clearChat()">clear</button>
+  <span id="status"></span>
+</div>
+
+<div id="chatbox"></div>
+
+<div id="inputbar">
+  <textarea id="prompt" rows="1" placeholder="message… Ctrl+Enter to send"></textarea>
+  <button id="sendBtn" onclick="send()">send</button>
+  <button id="stopBtn" onclick="stop()" disabled>stop</button>
+</div>
+
+<script>
+const chatbox = document.getElementById("chatbox");
+const promptEl = document.getElementById("prompt");
+const sendBtn = document.getElementById("sendBtn");
+const stopBtn = document.getElementById("stopBtn");
+const statusEl = document.getElementById("status");
+const modelSel = document.getElementById("modelSelect");
+
+let history = [];
+let controller = null;
+
+function setStatus(t) { statusEl.textContent = t; }
+
+function renderMd(text) {
+  if (typeof marked !== "undefined" && marked.parse) {
+    try { return marked.parse(text || ""); } catch(e) {}
+  }
+  return (text || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/\n/g,"<br>");
+}
+
+function addMsg(role, text) {
+  const d = document.createElement("div");
+  d.className = "m " + role;
+
+  const roleEl = document.createElement("div");
+  roleEl.className = "role";
+  roleEl.textContent = role === "user" ? "you" : "ai";
+
+  const bodyEl = document.createElement("div");
+  bodyEl.className = "body";
+  if (role === "user") {
+    bodyEl.textContent = text;
+  } else {
+    bodyEl.innerHTML = renderMd(text);
+  }
+
+  d.appendChild(roleEl);
+  d.appendChild(bodyEl);
+  chatbox.appendChild(d);
+  chatbox.scrollTop = chatbox.scrollHeight;
+  return bodyEl;
+}
+
+function clearChat() {
+  history = [];
+  chatbox.innerHTML = "";
+}
+
+async function loadModels() {
+  setStatus("loading models…");
+  try {
+    const r = await fetch("/v1/models", { headers: { Authorization: "Bearer sk-local" } });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const raw = await r.text();
+    const json = JSON.parse(raw);
+    const list = (Array.isArray(json.data) ? json.data : []).map(x => x.id).filter(Boolean);
+    if (!list.length) throw new Error("empty");
+    modelSel.innerHTML = "";
+    list.forEach(id => { const o = document.createElement("option"); o.value = id; o.text = id; modelSel.add(o); });
+    setStatus("ready | " + list.length + " models");
+  } catch(e) {
+    setStatus("model load failed: " + e.message);
+    modelSel.innerHTML = "<option>failed</option>";
+  }
+}
+
+function stop() {
+  if (controller) controller.abort();
+}
+
+async function send() {
+  const text = promptEl.value.trim();
+  if (!text) return;
+  promptEl.value = "";
+
+  history.push({ role: "user", content: text });
+  addMsg("user", text);
+
+  const bodyEl = addMsg("assistant", "");
+  let full = "";
+  let chunks = 0;
+  const t0 = performance.now();
+
+  sendBtn.disabled = true;
+  stopBtn.disabled = false;
+  setStatus("streaming…");
+
+  controller = new AbortController();
+  try {
+    const r = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer sk-local" },
+      body: JSON.stringify({ model: modelSel.value, messages: history, stream: true }),
+      signal: controller.signal
+    });
+    if (!r.ok) { const t = await r.text().catch(()=>""); throw new Error("HTTP " + r.status + " " + t.slice(0,200)); }
+
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s.startsWith("data:")) continue;
+        const d = s.slice(5).trim();
+        if (!d || d === "[DONE]") continue;
+        try {
+          const chunk = JSON.parse(d)?.choices?.[0]?.delta?.content;
+          if (chunk) {
+            full += chunk;
+            chunks++;
+            bodyEl.innerHTML = renderMd(full) + '<span class="cursor">▌</span>';
+            chatbox.scrollTop = chatbox.scrollHeight;
+          }
+        } catch(_) {}
+      }
+    }
+
+    bodyEl.innerHTML = renderMd(full);
+    history.push({ role: "assistant", content: full });
+
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+    setStatus("ready | " + chunks + " chunks, " + elapsed + "s");
+  } catch(e) {
+    if (e.name === "AbortError") {
+      bodyEl.innerHTML = renderMd(full || "（stopped）");
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      setStatus("stopped | " + chunks + " chunks, " + elapsed + "s");
+      if (full) history.push({ role: "assistant", content: full });
+    } else {
+      setStatus("error: " + e.message.slice(0, 80));
+      bodyEl.innerHTML = '<span style="color:var(--err)">' + e.message + '</span>';
+      bodyEl.parentElement.className = "m err";
+    }
+  } finally {
+    controller = null;
+    sendBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+}
+
+promptEl.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); send(); }
+});
+
+loadModels();
+</script>
+</body>
+</html>

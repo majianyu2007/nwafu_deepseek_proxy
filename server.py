@@ -28,7 +28,8 @@ from Crypto.Util.Padding import pad
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, StreamingResponse
 import uvicorn
 
 # ============================================================
@@ -388,6 +389,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+INDEX_HTML_PATH = os.path.join(STATIC_DIR, "index.html")
+app.mount("/static", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+
 
 # ============================================================
 # 健康检查
@@ -396,21 +401,27 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {
-        "service": "NWAFU DeepSeek Proxy",
-        "status": "running",
-        "target": TARGET_BASE,
-        "login_ok": session_mgr.login_ok,
-        "usage": {
-            "api_base": f"http://localhost:{PROXY_PORT}/v1",
-            "note": "所有 /v1/* 路径透明转发到源站，与源站 API 保持一致",
-        },
-    }
+    try:
+        with open(INDEX_HTML_PATH, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(
+            content="缺少静态页面：static/index.html（请确认你已创建 static/ 目录）",
+            status_code=500,
+        )
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "login_ok": session_mgr.login_ok}
+    return {
+        "status": "ok",
+        "service": "NWAFU DeepSeek Proxy",
+        "target": TARGET_BASE,
+        "login_ok": session_mgr.login_ok,
+        "api_base": f"http://localhost:{PROXY_PORT}/v1",
+        "ui": "/",
+        "note": "所有 /v1/* 路径透明转发到源站，与源站 API 保持一致",
+    }
 
 
 # ============================================================
@@ -452,7 +463,7 @@ HOP_BY_HOP_HEADERS = frozenset({
     "host", "connection", "keep-alive", "transfer-encoding",
     "te", "trailer", "upgrade", "proxy-authorization",
     "proxy-authenticate", "content-length",
-    "authorization",
+    "authorization", "accept-encoding",
 })
 
 STRIP_RESPONSE_HEADERS = frozenset({
@@ -619,6 +630,22 @@ def _error_response(status_code: int, message: str) -> Response:
 # ============================================================
 # 注册代理路由 —— 所有路径无差别转发
 # ============================================================
+
+
+@app.get("/v1")
+@app.get("/v1/")
+async def v1_index():
+    """直接访问 /v1 时返回友好提示而非走代理"""
+    return {
+        "message": "NWAFU DeepSeek Proxy — /v1 API 端点",
+        "endpoints": {
+            "models": "/v1/models",
+            "chat": "/v1/chat/completions",
+            "embeddings": "/v1/embeddings",
+        },
+        "ui": "/",
+        "note": "客户端 API Key 可填任意值，代理会自动替换",
+    }
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
