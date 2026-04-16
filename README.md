@@ -4,15 +4,15 @@
 
 学校通过 [Open WebUI](https://github.com/open-webui/open-webui) 部署了 DeepSeek / Qwen 系列大模型，但前方架设了金智教育（Wisedu）统一身份认证网关，所有请求都会被拦截跳转至 AuthServer 登录页面。这意味着你没法直接拿到可用的 API 地址——即使拼上了正确的 token，请求也会在中间件层被 302 到 CAS 登录。
 
-本项目通过在本地运行一个 Python 反向代理来解决这个问题：
+本项目通过在本地运行一个 **透明反向代理** 来解决该问题：
 
 1. 启动时自动完成 CAS 认证（包括 AES 密码加密、表单提交、ticket 兑换）
 2. 获取到目标站点的有效 session cookie
-3. 在本地暴露 `http://localhost:8000/v1` 全能 API 端点（chat / embeddings / rerank / models）
+3. 在本地暴露 `http://localhost:8000/v1`，**透明转发所有请求到源站**
 4. 所有经过代理的请求会自动附带 CAS cookie + Open WebUI API Key
-5. 后台定时保活，cookie 过期时无感刷新
+5. 后台定时保活，cookie 过期时自动刷新
 
-你只需要把 API 地址指向 `localhost:8000/v1`，就能在 Chatbox、LobeChat 等第三方客户端中正常使用学校的模型了。支持对话补全、向量嵌入、文档重排序等全部主流 API 接口。
+代理不对任何 API 端点做特殊处理；源站支持的能力将被原样透传。将 API 地址指向 `localhost:8000/v1` 后，即可在 Chatbox、LobeChat 等第三方客户端中正常使用学校的模型。
 
 ## 快速开始
 
@@ -44,7 +44,7 @@ cp .env.example .env
 |------|------|----------|
 | `NWAFU_USERNAME` | 学号 | — |
 | `NWAFU_PASSWORD` | 统一身份认证密码 | 密码含 `#` 等字符时用双引号包裹 |
-| `OPENWEBUI_API_KEY` | Open WebUI 的 API 密钥 | 登录 Open WebUI → 个人设置 → 账号 → API 密钥 |
+| `OPENWEBUI_API_KEY` | Open WebUI 的 API 密钥 | 登录 Open WebUI，在“个人设置 / 账号 / API 密钥”中生成 |
 
 ### 启动
 
@@ -89,32 +89,17 @@ python test_api.py Qwen3-235B-A22B
 
 ### 支持的 API 端点
 
+所有 `/v1/*` 路径都会被透明转发到源站。常用端点包括：
+
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/v1/models` | GET | 查看全部可用模型 |
 | `/v1/chat/completions` | POST | 对话补全（支持流式） |
 | `/v1/embeddings` | POST | 向量嵌入 |
-| `/v1/rerank` | POST | 文档重排序（Jina / Cohere 兼容） |
+| `/v1/rerank` | POST | 文档重排序（需源站支持） |
+| `/v1/*` | * | 源站支持的任何其它端点 |
 
-#### Rerank API 用法
-
-```bash
-curl http://localhost:8000/v1/rerank \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "什么是机器学习",
-    "documents": [
-      "机器学习是人工智能的一个分支",
-      "今天天气不错",
-      "深度学习是机器学习的子集"
-    ],
-    "top_n": 2
-  }'
-```
-
-- `model` 可留空，代理会自动选择上游可用的 rerank 模型
-- `documents` 支持字符串数组或 `{"text": "..."}` 格式
-- 如果上游无原生 rerank 接口，会自动回退到 embeddings 余弦相似度排序
+> 代理不对请求/响应做任何业务层修改，行为由源站能力决定。
 
 ## 客户端配置
 
@@ -139,19 +124,18 @@ curl http://localhost:8000/v1/rerank \
 ```
 第三方客户端 (Chatbox / LobeChat / curl / ...)
         │
-        │  /v1/chat/completions  (对话)
-        │  /v1/embeddings        (嵌入)
-        │  /v1/rerank            (重排序)
+        │  任意 /v1/* 请求
         ▼
-localhost:8000  ← 本地 FastAPI 代理
+localhost:8000  ← 本地 FastAPI 透明反向代理
         │
-        │  ① CAS session cookie (通过认证中间件)
-        │  ② Authorization: Bearer sk-xxx (通过 Open WebUI)
+        │  ① 注入 CAS session cookie
+        │  ② 注入 Authorization: Bearer sk-xxx
+        │  ③ 透明转发, 不修改请求/响应内容
         ▼
 deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
         │
         ▼
-    后端大模型 (DeepSeek / Qwen / Reranker / ...)
+    后端大模型 (DeepSeek / Qwen / ...)
 ```
 
 ### 认证流程细节
@@ -161,23 +145,23 @@ deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
 1. `GET /authserver/login?service=...` 获取登录页，提取 `execution` 和 `pwdEncryptSalt`
 2. 使用与前端一致的 AES-CBC (PKCS7 padding) 加密密码：`randomString(64) + password`
 3. `POST /authserver/login` 提交表单
-4. 跟随 302 重定向链：AuthServer → CAS callback（带 ST ticket） → 目标站
+4. 跟随 302 重定向链：AuthServer 到 CAS callback（携带 ST ticket）再到目标站
 5. 在重定向过程中收集 session cookie
 
 ### Cookie 保活
 
-- 每 5 分钟向目标站发送心跳请求
+- 每 5 分钟向目标站发送轻量 HEAD 心跳请求
 - 25 分钟无活动主动刷新
-- 检测到 302 / 401 / 403 时自动重新认证
+- 检测到认证失效时自动重新认证（精确区分 CAS 失效与上游业务错误）
 - 对客户端完全透明，无需手动干预
 
 ## 配置项一览
 
 | 环境变量 | 必填 | 默认值 | 说明 |
 |----------|------|--------|------|
-| `NWAFU_USERNAME` | ✅ | — | 学号 |
-| `NWAFU_PASSWORD` | ✅ | — | 密码 |
-| `OPENWEBUI_API_KEY` | ✅ | — | Open WebUI API Key |
+| `NWAFU_USERNAME` | 是 | — | 学号 |
+| `NWAFU_PASSWORD` | 是 | — | 密码 |
+| `OPENWEBUI_API_KEY` | 是 | — | Open WebUI API Key |
 | `PROXY_PORT` | | `8000` | 代理监听端口 |
 | `TARGET_HOST` | | `deepseek.nwafu.edu.cn` | 目标 Open WebUI 域名 |
 | `AUTH_SERVER` | | `https://authserver.nwafu.edu.cn` | AuthServer 地址 |
