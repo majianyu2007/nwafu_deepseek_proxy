@@ -340,7 +340,10 @@ class AuthSessionManager:
     async def close(self):
         await self.stop_keepalive()
         if self._client:
-            await self._client.aclose()
+            try:
+                await asyncio.wait_for(self._client.aclose(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
 
 
 # ============================================================
@@ -435,7 +438,7 @@ def _is_auth_redirect(resp: httpx.Response, *, is_stream: bool = False) -> bool:
     需要与"上游正常业务错误"区分: Open WebUI 在 API Key 无效或
     模型不存在时也会返回 401/403, 但 body 是 JSON。
     """
-    if resp.status_code in (301, 302):
+    if resp.status_code in (301, 302, 307):
         location = resp.headers.get("location", "")
         if "authserver" in location.lower() or "/login" in location.lower():
             return True
@@ -446,10 +449,6 @@ def _is_auth_redirect(resp: httpx.Response, *, is_stream: bool = False) -> bool:
         if "application/json" in content_type:
             return False
         return True
-
-    if resp.status_code == 200 and not is_stream:
-        if "text/html" in content_type:
-            return True
 
     return False
 
@@ -516,7 +515,7 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
                     content=body,
                     timeout=STREAM_TIMEOUT,
                 )
-                resp = await client.send(req, stream=True)
+                resp = await client.send(req, stream=True, follow_redirects=False)
 
                 if _is_auth_redirect(resp, is_stream=True):
                     await resp.aclose()
@@ -648,8 +647,16 @@ async def v1_index():
     }
 
 
+@app.get("/v1/chat/completions")
+async def proxy_v1_chat_get():
+    """显式拦截对聊天 API 的非规范 GET 测试，返回更标准友好的错误"""
+    return _error_response(405, "Method Not Allowed. Please use POST for /v1/chat/completions.")
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_v1(request: Request, path: str):
+    if path == "chat/completions" and request.method == "GET":
+        return _error_response(405, "Method Not Allowed. Please use POST for /v1/chat/completions.")
     return await _proxy_request(request, f"/v1/{path}")
 
 
@@ -693,4 +700,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=PROXY_PORT,
         log_level="info",
+        timeout_graceful_shutdown=2,
     )
