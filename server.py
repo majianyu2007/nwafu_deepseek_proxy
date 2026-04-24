@@ -30,35 +30,14 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, StreamingResponse
+from dotenv import load_dotenv
 import uvicorn
 
 # ============================================================
 # 配置与日志
 # ============================================================
 
-def _load_dotenv(path: str = ".env") -> None:
-    """极简 dotenv（兼容 export 前缀与引号包裹）。"""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("export "):
-                    line = line[len("export "):].lstrip()
-                if "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-                    value = value[1:-1]
-                os.environ.setdefault(key, value)
-    except FileNotFoundError:
-        return
-
-
-_load_dotenv()
+load_dotenv(override=False)
 
 request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 
