@@ -13,19 +13,19 @@ import base64
 import json
 import logging
 import os
-import random
+import re
 import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urljoin, quote
 
 import httpx
-from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -36,33 +36,165 @@ import uvicorn
 # 配置与日志
 # ============================================================
 
-load_dotenv()
+def _load_dotenv(path: str = ".env") -> None:
+    """极简 dotenv（兼容 export 前缀与引号包裹）。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        return
+
+
+_load_dotenv()
+
+request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class _RequestIDFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003 - logging 约定
+        record.request_id = request_id_ctx.get()
+        return True
+
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] [%(request_id)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("proxy")
 
-USERNAME = os.getenv("NWAFU_USERNAME", "")
-PASSWORD = os.getenv("NWAFU_PASSWORD", "")
-PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
-TARGET_HOST = os.getenv("TARGET_HOST", "deepseek.nwafu.edu.cn")
-OPENWEBUI_API_KEY = os.getenv("OPENWEBUI_API_KEY", "")
-AUTH_SERVER = os.getenv("AUTH_SERVER", "https://authserver.nwafu.edu.cn")
+_request_id_filter = _RequestIDFilter()
+# 给 handler 加 Filter，确保包括 httpx/uvicorn 等所有日志都有 request_id 字段
+_root_logger = logging.getLogger()
+for _h in _root_logger.handlers:
+    _h.addFilter(_request_id_filter)
 
-TARGET_BASE = f"https://{TARGET_HOST}"
+# 统一 uvicorn 的日志风格：清空其默认 handler，交由 root formatter 输出
+for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    _l = logging.getLogger(_name)
+    _l.handlers.clear()
+    _l.propagate = True
+
+COOKIE_TTL_SECONDS = 25 * 60
+LOGIN_COOLDOWN_SECONDS = 5.0
+KEEPALIVE_INTERVAL_SECONDS = 5 * 60
+MAX_LOGIN_REDIRECTS = 10
+PROXY_MAX_RETRIES = 2
+NETWORK_RETRY_ATTEMPTS = 3
 
 STREAM_TIMEOUT = httpx.Timeout(300.0, connect=15.0)
 DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=15.0)
 
-if not USERNAME or not PASSWORD:
-    logger.error("缺少必填环境变量：NWAFU_USERNAME / NWAFU_PASSWORD（请在 .env 中配置）")
-    sys.exit(1)
+_RETRIABLE_NET_ERRORS = (
+    httpx.ConnectError,
+    httpx.NetworkError,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
 
-if not OPENWEBUI_API_KEY:
-    logger.warning("未配置 OPENWEBUI_API_KEY：上游可能返回 401/403（请在 .env 中配置）")
+_LOGIN_ERROR_MESSAGES = {
+    "FAIL_UPNOTMATCH": "密码错误或账户不存在",
+    "CAPTCHA_NOTMATCH": "需要输入验证码 (账号可能被临时锁定, 请稍后再试)",
+    "LOCK": "账户已被锁定",
+}
+
+
+_RE_INPUT_BY_ID = lambda name: re.compile(  # noqa: E731 - 保持局部工具形态
+    rf'<input\b[^>]*\bid=["\']{re.escape(name)}["\'][^>]*>', re.I
+)
+_RE_VALUE_ATTR = re.compile(r'\bvalue=["\']([^"\']*)["\']', re.I)
+_RE_ERROR_TIP = re.compile(
+    r'id=["\']formErrorTip["\'][^>]*>.*?<span[^>]*>([^<]+)</span>',
+    re.S | re.I,
+)
+
+
+def _extract_input_value(html: str, input_id: str) -> str | None:
+    tag_match = _RE_INPUT_BY_ID(input_id).search(html)
+    if not tag_match:
+        return None
+    val = _RE_VALUE_ATTR.search(tag_match.group(0))
+    return val.group(1) if val else ""
+
+
+def _parse_login_form(html: str) -> tuple[str, str]:
+    execution = _extract_input_value(html, "execution")
+    salt = _extract_input_value(html, "pwdEncryptSalt")
+    if execution is None or salt is None:
+        raise RuntimeError("登录页结构变更：无法提取 execution/pwdEncryptSalt")
+    return execution, salt
+
+
+def _extract_error_text(html: str) -> str | None:
+    m = _RE_ERROR_TIP.search(html)
+    return m.group(1).strip() if m else None
+
+
+@dataclass(frozen=True)
+class Settings:
+    username: str
+    password: str
+    proxy_port: int
+    target_host: str
+    openwebui_api_key: str
+    auth_server: str
+    cors_origins: list[str]
+
+    @property
+    def target_base(self) -> str:
+        return f"https://{self.target_host}"
+
+
+def load_settings() -> Settings:
+    username = os.getenv("NWAFU_USERNAME", "").strip()
+    password = os.getenv("NWAFU_PASSWORD", "")
+    proxy_port = int(os.getenv("PROXY_PORT", "8000"))
+    target_host = os.getenv("TARGET_HOST", "deepseek.nwafu.edu.cn").strip()
+    openwebui_api_key = os.getenv("OPENWEBUI_API_KEY", "").strip()
+    auth_server = os.getenv("AUTH_SERVER", "https://authserver.nwafu.edu.cn").strip()
+    cors_raw = os.getenv("CORS_ORIGINS", "").strip()
+    cors_origins = ["*"] if not cors_raw else [p.strip() for p in cors_raw.split(",") if p.strip()]
+
+    if not username or not password:
+        raise SystemExit("缺少必填环境变量：NWAFU_USERNAME / NWAFU_PASSWORD（请在 .env 中配置）")
+
+    if not openwebui_api_key:
+        logger.warning("未配置 OPENWEBUI_API_KEY：上游可能返回 401/403（请在 .env 中配置）")
+
+    return Settings(
+        username=username,
+        password=password,
+        proxy_port=proxy_port,
+        target_host=target_host,
+        openwebui_api_key=openwebui_api_key,
+        auth_server=auth_server,
+        cors_origins=cors_origins,
+    )
+
+
+settings = load_settings()
+
+USERNAME = settings.username
+PASSWORD = settings.password
+PROXY_PORT = settings.proxy_port
+TARGET_HOST = settings.target_host
+OPENWEBUI_API_KEY = settings.openwebui_api_key
+AUTH_SERVER = settings.auth_server
+
+TARGET_BASE = settings.target_base
 
 
 # ============================================================
@@ -122,11 +254,11 @@ class AuthSessionManager:
         self._lock = asyncio.Lock()
         self._last_login_time: float = 0
         self._login_ok: bool = False
-        self._cookie_ttl: float = 25 * 60
-        self._keepalive_task: Optional[asyncio.Task] = None
-        self._login_inflight: Optional[asyncio.Future] = None
+        self._cookie_ttl: float = float(COOKIE_TTL_SECONDS)
+        self._keepalive_task: Optional[asyncio.Task[None]] = None
+        self._login_inflight: Optional[asyncio.Future[httpx.AsyncClient]] = None
         self._last_login_failure: float = 0
-        self._login_cooldown: float = 5.0
+        self._login_cooldown: float = float(LOGIN_COOLDOWN_SECONDS)
 
     @property
     def login_ok(self) -> bool:
@@ -188,7 +320,7 @@ class AuthSessionManager:
 
         return await fut
 
-    async def _run_login(self, fut: asyncio.Future):
+    async def _run_login(self, fut: asyncio.Future[httpx.AsyncClient]):
         try:
             await self._do_login()
             fut.set_result(self._client)
@@ -201,27 +333,42 @@ class AuthSessionManager:
                 if self._login_inflight is fut:
                     self._login_inflight = None
 
+    async def _retry_request(self, method: str, url: str, *, follow_redirects: bool = False, **kwargs) -> httpx.Response:
+        assert self._client is not None
+        last_exc: Optional[Exception] = None
+        for attempt in range(NETWORK_RETRY_ATTEMPTS):
+            try:
+                return await self._client.request(method, url, follow_redirects=follow_redirects, **kwargs)
+            except _RETRIABLE_NET_ERRORS as e:
+                last_exc = e
+                if attempt < NETWORK_RETRY_ATTEMPTS - 1:
+                    logger.warning("网络异常（%s %s）：%s，准备重试", method, str(url)[:60], e)
+                    await asyncio.sleep(1.0 * (2 ** attempt))
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
+
+    async def _fetch_login_page(self, login_url: str) -> httpx.Response:
+        logger.info("请求登录页：GET %s...", login_url[:80])
+        return await self._retry_request("GET", login_url, follow_redirects=False)
+
+    async def _submit_login_form(self, login_url: str, login_data: dict) -> httpx.Response:
+        logger.info("提交登录表单：POST /authserver/login")
+        return await self._retry_request("POST", login_url, data=login_data, follow_redirects=False)
+
+    def _extract_login_error(self, resp: httpx.Response) -> str:
+        try:
+            data = resp.json()
+            code = data.get("resultCode", "")
+            return _LOGIN_ERROR_MESSAGES.get(code, f"错误码: {code}")
+        except Exception:
+            text = _extract_error_text(resp.text)
+            return text or "未知错误"
+
     async def _do_login(self):
         """执行完整的金智 AuthServer 登录流程"""
         logger.info("开始统一身份认证登录（AuthServer CAS）")
-
-        async def _sleep_backoff(attempt: int):
-            await asyncio.sleep(1.0 * (2 ** attempt))
-
-        async def _request_with_retry(method: str, url: str, **kwargs) -> httpx.Response:
-            last_exc: Optional[Exception] = None
-            for attempt in range(3):
-                try:
-                    return await self._client.request(method, url, **kwargs)
-                except (httpx.ConnectError, httpx.NetworkError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-                    last_exc = e
-                    if attempt < 2:
-                        logger.warning("登录阶段网络异常（%s %s）：%s，准备重试", method, str(url)[:60], e)
-                        await _sleep_backoff(attempt)
-                        continue
-                    raise
-            assert last_exc is not None
-            raise last_exc
 
         if self._client:
             try:
@@ -240,8 +387,7 @@ class AuthSessionManager:
             encoded_service = quote(service_url, safe="")
             login_url = f"{AUTH_SERVER}/authserver/login?service={encoded_service}"
 
-            logger.info("请求登录页：GET %s...", login_url[:80])
-            resp = await _request_with_retry("GET", login_url, follow_redirects=False)
+            resp = await self._fetch_login_page(login_url)
 
             if resp.status_code in (301, 302):
                 location = resp.headers.get("location", "")
@@ -252,18 +398,7 @@ class AuthSessionManager:
                 logger.info("登录成功（复用 TGC）")
                 return
 
-            html = resp.text
-            soup = BeautifulSoup(html, "lxml")
-
-            execution_input = soup.find("input", {"id": "execution"})
-            if not execution_input:
-                raise RuntimeError("无法提取 execution 参数, 登录页结构可能已变更")
-            execution = execution_input.get("value", "")
-
-            salt_input = soup.find("input", {"id": "pwdEncryptSalt"})
-            if not salt_input:
-                raise RuntimeError("无法提取 pwdEncryptSalt, 登录页结构可能已变更")
-            salt = salt_input.get("value", "")
+            execution, salt = _parse_login_form(resp.text)
 
             logger.info("解析表单参数成功：salt=%s**** execution=%s...", salt[:4], execution[:20])
 
@@ -283,13 +418,7 @@ class AuthSessionManager:
                 "execution": execution,
             }
 
-            logger.info("提交登录表单：POST /authserver/login")
-            resp = await _request_with_retry(
-                "POST",
-                login_url,
-                data=login_data,
-                follow_redirects=False,
-            )
+            resp = await self._submit_login_form(login_url, login_data)
 
             # Step 4: 处理登录结果
             if resp.status_code in (301, 302):
@@ -300,27 +429,7 @@ class AuthSessionManager:
                 self._last_login_time = time.monotonic()
                 logger.info("认证完成，会话 Cookie 已就绪")
             else:
-                error_msg = "未知错误"
-                try:
-                    data = resp.json()
-                    code = data.get("resultCode", "")
-                    if code == "FAIL_UPNOTMATCH":
-                        error_msg = "密码错误或账户不存在"
-                    elif code == "CAPTCHA_NOTMATCH":
-                        error_msg = "需要输入验证码 (账号可能被临时锁定, 请稍后再试)"
-                    elif code == "LOCK":
-                        error_msg = "账户已被锁定"
-                    else:
-                        error_msg = f"错误码: {code}"
-                except Exception:
-                    error_soup = BeautifulSoup(resp.text, "lxml")
-                    error_tip = error_soup.find(id="formErrorTip")
-                    if error_tip:
-                        span = error_tip.find("span")
-                        if span:
-                            error_msg = span.get_text(strip=True)
-
-                raise RuntimeError(f"AuthServer 登录失败: {error_msg}")
+                raise RuntimeError(f"AuthServer 登录失败: {self._extract_login_error(resp)}")
 
         except Exception as e:
             self._login_ok = False
@@ -332,7 +441,7 @@ class AuthSessionManager:
         手动跟随 CAS 重定向链, 确保拿到目标站点的所有 Cookie。
         authserver 到 cas callback（携带 ST ticket）再到目标站主页
         """
-        max_redirects = 10
+        max_redirects = MAX_LOGIN_REDIRECTS
         current_url = location
 
         for i in range(max_redirects):
@@ -340,24 +449,7 @@ class AuthSessionManager:
                 break
 
             logger.info("跟随重定向[%d/%d]：%s...", i + 1, max_redirects, current_url[:80])
-            # 这里很容易遇到瞬时网络抖动，做轻量退避重试
-            last_exc: Optional[Exception] = None
-            resp: Optional[httpx.Response] = None
-            for attempt in range(3):
-                try:
-                    resp = await self._client.get(current_url, follow_redirects=False)
-                    last_exc = None
-                    break
-                except (httpx.ConnectError, httpx.NetworkError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-                    last_exc = e
-                    if attempt < 2:
-                        logger.warning("重定向链网络异常：%s，准备重试", e)
-                        await asyncio.sleep(1.0 * (2 ** attempt))
-                        continue
-                    raise
-
-            if resp is None and last_exc is not None:
-                raise last_exc
+            resp = await self._retry_request("GET", current_url, follow_redirects=False)
 
             if resp.status_code in (301, 302):
                 current_url = resp.headers.get("location", "")
@@ -396,7 +488,7 @@ class AuthSessionManager:
         """启动后台保活定时器"""
         async def _keepalive_loop():
             while True:
-                await asyncio.sleep(5 * 60)
+                await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
                 try:
                     await self.check_and_refresh()
                 except Exception as e:
@@ -412,6 +504,8 @@ class AuthSessionManager:
                 await self._keepalive_task
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                logger.debug("keepalive_task 退出异常：%s", e)
 
     async def close(self):
         await self.stop_keepalive()
@@ -433,74 +527,97 @@ session_mgr = AuthSessionManager()
 # FastAPI 应用
 # ============================================================
 
+def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    index_html_path = os.path.join(static_dir, "index.html")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("服务启动：target=%s user=%s", TARGET_BASE, USERNAME)
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        logger.info("服务启动：target=%s user=%s", TARGET_BASE, USERNAME)
 
-    try:
-        await session_mgr.ensure_login()
-        logger.info("初始登录成功")
-    except Exception as e:
-        logger.error("初始登录失败：%s", e)
-        logger.error("服务将继续启动；后续请求会触发重试登录")
+        try:
+            await manager.ensure_login()
+            logger.info("初始登录成功")
+        except Exception as e:
+            logger.error("初始登录失败：%s", e)
+            logger.error("服务将继续启动；后续请求会触发重试登录")
 
-    await session_mgr.start_keepalive()
+        await manager.start_keepalive()
 
-    yield
+        yield
 
-    logger.info("服务关闭中")
-    await session_mgr.close()
+        logger.info("服务关闭中")
+        await manager.close()
+
+    _app = FastAPI(
+        title="NWAFU DeepSeek Proxy",
+        description="本地透明代理网关, 自动处理校园认证, 无差别转发所有 API 请求",
+        lifespan=_lifespan,
+    )
+
+    @_app.middleware("http")
+    async def request_id_middleware(request: Request, call_next):
+        rid = secrets.token_hex(4)
+        token = request_id_ctx.set(rid)
+        t0 = time.monotonic()
+        response: Optional[Response] = None
+        try:
+            response = await call_next(request)
+            return response
+        except Exception:
+            logger.exception("event=http_error method=%s path=%s", request.method, request.url.path)
+            raise
+        finally:
+            request_id_ctx.reset(token)
+            if response is not None:
+                response.headers["X-Request-ID"] = rid
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                logger.info(
+                    "event=http method=%s path=%s status=%d ms=%d",
+                    request.method,
+                    request.url.path,
+                    response.status_code,
+                    elapsed_ms,
+                )
+
+    _app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_settings.cors_origins,
+        # 注意：allow_origins="*" 与 allow_credentials=True 在浏览器端不兼容
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    _app.mount("/static", StaticFiles(directory=static_dir, html=True), name="static")
+
+    @_app.get("/")
+    async def root():
+        try:
+            with open(index_html_path, "r", encoding="utf-8") as f:
+                return HTMLResponse(content=f.read())
+        except FileNotFoundError:
+            return HTMLResponse(
+                content="缺少静态页面：static/index.html（请确认你已创建 static/ 目录）",
+                status_code=500,
+            )
+
+    @_app.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "service": "NWAFU DeepSeek Proxy",
+            "target": TARGET_BASE,
+            "login_ok": manager.login_ok,
+            "api_base": f"http://localhost:{PROXY_PORT}/v1",
+            "ui": "/",
+            "note": "所有 /v1/* 路径透明转发到源站，与源站 API 保持一致",
+        }
+
+    return _app
 
 
-app = FastAPI(
-    title="NWAFU DeepSeek Proxy",
-    description="本地透明代理网关, 自动处理校园认证, 无差别转发所有 API 请求",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    # 注意：allow_origins="*" 与 allow_credentials=True 在浏览器端不兼容
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-INDEX_HTML_PATH = os.path.join(STATIC_DIR, "index.html")
-app.mount("/static", StaticFiles(directory=STATIC_DIR, html=True), name="static")
-
-
-# ============================================================
-# 健康检查
-# ============================================================
-
-
-@app.get("/")
-async def root():
-    try:
-        with open(INDEX_HTML_PATH, "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
-    except FileNotFoundError:
-        return HTMLResponse(
-            content="缺少静态页面：static/index.html（请确认你已创建 static/ 目录）",
-            status_code=500,
-        )
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "service": "NWAFU DeepSeek Proxy",
-        "target": TARGET_BASE,
-        "login_ok": session_mgr.login_ok,
-        "api_base": f"http://localhost:{PROXY_PORT}/v1",
-        "ui": "/",
-        "note": "所有 /v1/* 路径透明转发到源站，与源站 API 保持一致",
-    }
+app = create_app(settings, session_mgr)
 
 
 # ============================================================
@@ -508,25 +625,31 @@ async def health():
 # ============================================================
 
 
-def _is_auth_redirect(resp: httpx.Response, *, is_stream: bool = False) -> bool:
+def _is_login_redirect(resp: httpx.Response) -> bool:
+    if resp.status_code in (301, 302, 307):
+        location = resp.headers.get("location", "")
+        location_l = location.lower()
+        if "authserver" in location_l or "/login" in location_l:
+            return True
+    return False
+
+
+def _is_html_unauthorized(resp: httpx.Response) -> bool:
+    if resp.status_code not in (401, 403):
+        return False
+    content_type = resp.headers.get("content-type", "")
+    # Open WebUI 在 API Key 无效、模型不存在等情况也可能返回 401/403，
+    # 但 body 是 JSON；CAS 失效通常返回 HTML。
+    return "application/json" not in content_type
+
+
+def _is_auth_redirect(resp: httpx.Response) -> bool:
     """
     判断上游响应是否表明 CAS 会话已失效。
     需要与"上游正常业务错误"区分: Open WebUI 在 API Key 无效或
     模型不存在时也会返回 401/403, 但 body 是 JSON。
     """
-    if resp.status_code in (301, 302, 307):
-        location = resp.headers.get("location", "")
-        if "authserver" in location.lower() or "/login" in location.lower():
-            return True
-
-    content_type = resp.headers.get("content-type", "")
-
-    if resp.status_code in (401, 403):
-        if "application/json" in content_type:
-            return False
-        return True
-
-    return False
+    return _is_login_redirect(resp) or _is_html_unauthorized(resp)
 
 
 # ============================================================
@@ -538,12 +661,93 @@ HOP_BY_HOP_HEADERS = frozenset({
     "host", "connection", "keep-alive", "transfer-encoding",
     "te", "trailer", "upgrade", "proxy-authorization",
     "proxy-authenticate", "content-length",
+    # 注意：这里刻意丢弃客户端 Authorization，并在后续注入真实 OPENWEBUI_API_KEY。
     "authorization", "accept-encoding",
 })
 
 STRIP_RESPONSE_HEADERS = frozenset({
     "content-length", "transfer-encoding", "content-encoding",
 })
+
+
+_AUTH_EXPIRED = object()
+
+
+async def _read_request_body(request: Request) -> tuple[bytes, bool]:
+    body = await request.body()
+    is_stream = False
+    if body:
+        try:
+            body_json = json.loads(body)
+            is_stream = bool(body_json.get("stream", False))
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            pass
+    return body, is_stream
+
+
+def _build_target_url(request: Request, target_path: str) -> str:
+    target_url = f"{TARGET_BASE}{target_path}"
+    if request.url.query:
+        target_url += f"?{request.url.query}"
+    return target_url
+
+
+def _build_forward_headers(request: Request) -> dict[str, str]:
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+    headers["Host"] = TARGET_HOST
+    if OPENWEBUI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+    return headers
+
+
+def _strip_response_headers(headers: httpx.Headers) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k.lower() not in STRIP_RESPONSE_HEADERS}
+
+
+async def _forward(
+    client: httpx.AsyncClient,
+    *,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+    is_stream: bool,
+) -> Response | object:
+    req = client.build_request(
+        method=method,
+        url=url,
+        headers=headers,
+        content=body,
+        timeout=STREAM_TIMEOUT if is_stream else DEFAULT_TIMEOUT,
+    )
+    resp = await client.send(req, stream=True, follow_redirects=False)
+
+    if _is_auth_redirect(resp):
+        await resp.aclose()
+        return _AUTH_EXPIRED
+
+    resp_headers = _strip_response_headers(resp.headers)
+    media_type = resp.headers.get("content-type", "text/event-stream" if is_stream else None)
+
+    async def stream_generator():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        except (httpx.ReadError, httpx.RemoteProtocolError, httpx.TransportError) as e:
+            # 仅对 SSE 流式请求提供“最后一条 data:”兜底，避免客户端永远 hang。
+            if is_stream:
+                logger.error("流式响应中断：%s", e)
+                error_payload = json.dumps({"error": "upstream connection lost"}, ensure_ascii=False)
+                yield f"data: {error_payload}\n\n".encode("utf-8")
+        finally:
+            await resp.aclose()
+
+    return StreamingResponse(
+        stream_generator(),
+        status_code=resp.status_code,
+        headers=resp_headers,
+        media_type=media_type,
+    )
 
 
 async def _proxy_request(request: Request, target_path: str) -> Response:
@@ -554,181 +758,89 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
     - 自动检测流式请求并使用长超时
     - Cookie 失效时自动重登并重试
     """
-    max_retries = 2
     t0 = time.monotonic()
+    body, is_stream = await _read_request_body(request)
 
-    body = await request.body()
-
-    is_stream = False
-    if body:
-        try:
-            body_json = json.loads(body)
-            is_stream = body_json.get("stream", False)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
-    for attempt in range(max_retries):
+    for attempt in range(PROXY_MAX_RETRIES):
         # 先确保已登录。登录失败应返回干净的 503，而不是抛出到 ASGI
         try:
             client = await session_mgr.ensure_login()
         except UpstreamUnavailableError as e:
-            logger.warning("[%s %s] 登录被冷却拒绝：%s", request.method, target_path, e)
-            return _error_response(503, "上游暂时不可达，请稍后重试")
-        except (httpx.ConnectError, httpx.NetworkError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-            logger.warning("[%s %s] 登录阶段网络异常：%s", request.method, target_path, e)
-            return _error_response(503, "上游暂时不可达，请稍后重试")
+            logger.warning("登录被冷却拒绝：%s", e)
+            return _error_response(503, "上游暂时不可达，请稍后重试", error_type="login_cooldown")
+        except _RETRIABLE_NET_ERRORS as e:
+            logger.warning("登录阶段网络异常：%s", e)
+            return _error_response(503, "上游暂时不可达，请稍后重试", error_type="upstream_unreachable")
         except Exception as e:
-            logger.error("[%s %s] 登录失败：%s", request.method, target_path, e)
-            return _error_response(503, "登录失败，请稍后重试")
+            logger.error("登录失败：%s", e)
+            return _error_response(503, "登录失败，请稍后重试", error_type="login_failed")
 
-        target_url = f"{TARGET_BASE}{target_path}"
-        if request.url.query:
-            target_url += f"?{request.url.query}"
-
-        headers = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in HOP_BY_HOP_HEADERS
-        }
-        headers["Host"] = TARGET_HOST
-        if OPENWEBUI_API_KEY:
-            headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+        target_url = _build_target_url(request, target_path)
+        headers = _build_forward_headers(request)
 
         try:
-            if is_stream:
-                req = client.build_request(
-                    method=request.method,
-                    url=target_url,
-                    headers=headers,
-                    content=body,
-                    timeout=STREAM_TIMEOUT,
-                )
-                resp = await client.send(req, stream=True, follow_redirects=False)
+            result = await _forward(
+                client,
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                body=body,
+                is_stream=is_stream,
+            )
 
-                if _is_auth_redirect(resp, is_stream=True):
-                    await resp.aclose()
-                    if attempt < max_retries - 1:
-                        logger.warning("[%s %s] 认证失效（stream），准备重新登录并重试", request.method, target_path)
-                        await session_mgr.force_relogin()
-                        await asyncio.sleep(1)
-                        continue
-                    return _error_response(401, "认证失败, 请检查账号密码")
+            if result is _AUTH_EXPIRED:
+                if attempt < PROXY_MAX_RETRIES - 1:
+                    logger.warning("认证失效，准备重新登录并重试")
+                    await session_mgr.force_relogin()
+                    await asyncio.sleep(1)
+                    continue
+                return _error_response(401, "认证失败, 请检查账号密码", error_type="auth_failed")
 
-                elapsed = int((time.monotonic() - t0) * 1000)
-                logger.info(
-                    "event=proxy_response method=%s path=%s status=%d stream=true connect_ms=%d",
-                    request.method,
-                    target_path,
-                    resp.status_code,
-                    elapsed,
-                )
-
-                async def stream_generator():
-                    try:
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-                    except (httpx.ReadError, httpx.RemoteProtocolError, httpx.TransportError) as e:
-                        logger.error("[%s %s] 流式响应中断：%s", request.method, target_path, e)
-                        error_payload = json.dumps({"error": "upstream connection lost"})
-                        yield f"data: {error_payload}\n\n".encode("utf-8")
-                    finally:
-                        await resp.aclose()
-
-                resp_headers = {
-                    k: v for k, v in resp.headers.items()
-                    if k.lower() not in STRIP_RESPONSE_HEADERS
-                }
-
-                return StreamingResponse(
-                    stream_generator(),
-                    status_code=resp.status_code,
-                    headers=resp_headers,
-                    media_type=resp.headers.get("content-type", "text/event-stream"),
-                )
-
-            else:
-                resp = await client.request(
-                    method=request.method,
-                    url=target_url,
-                    headers=headers,
-                    content=body,
-                    follow_redirects=False,
-                    timeout=DEFAULT_TIMEOUT,
-                )
-
-                if _is_auth_redirect(resp, is_stream=False):
-                    if attempt < max_retries - 1:
-                        logger.warning("[%s %s] 认证失效，准备重新登录并重试", request.method, target_path)
-                        await session_mgr.force_relogin()
-                        await asyncio.sleep(1)
-                        continue
-                    return _error_response(401, "认证失败, 请检查账号密码")
-
-                elapsed = int((time.monotonic() - t0) * 1000)
-                logger.info(
-                    "event=proxy_response method=%s path=%s status=%d stream=false bytes=%d ms=%d",
-                    request.method,
-                    target_path,
-                    resp.status_code,
-                    len(resp.content),
-                    elapsed,
-                )
-
-                resp_headers = {
-                    k: v for k, v in resp.headers.items()
-                    if k.lower() not in STRIP_RESPONSE_HEADERS
-                }
-
-                return Response(
-                    content=resp.content,
-                    status_code=resp.status_code,
-                    headers=resp_headers,
-                    media_type=resp.headers.get("content-type"),
-                )
+            elapsed = int((time.monotonic() - t0) * 1000)
+            logger.info(
+                "event=proxy_response method=%s path=%s status=%s stream=%s ms=%d",
+                request.method,
+                target_path,
+                getattr(result, "status_code", "-"),
+                "true" if is_stream else "false",
+                elapsed,
+            )
+            return result
 
         except httpx.TimeoutException:
             elapsed = int((time.monotonic() - t0) * 1000)
-            logger.error("[%s %s] 上游请求超时（ms=%d）", request.method, target_path, elapsed)
-            if attempt < max_retries - 1:
+            logger.error("上游请求超时（ms=%d）", elapsed)
+            if attempt < PROXY_MAX_RETRIES - 1:
                 await asyncio.sleep(1)
                 continue
-            return _error_response(504, "上游请求超时")
+            return _error_response(504, "上游请求超时", error_type="upstream_timeout")
 
-        except (httpx.ConnectError, httpx.NetworkError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+        except _RETRIABLE_NET_ERRORS as e:
             # 网络错误：不动 session，不触发重登；仅对该请求做退避重试
             elapsed = int((time.monotonic() - t0) * 1000)
             logger.warning(
-                "[%s %s] 上游网络抖动：%s（ms=%d）",
-                request.method,
-                target_path,
+                "上游网络抖动：%s（ms=%d）",
                 e,
                 elapsed,
             )
-            if attempt < max_retries - 1:
+            if attempt < PROXY_MAX_RETRIES - 1:
                 await asyncio.sleep(0.5 * (2 ** attempt))
                 continue
-            return _error_response(503, "上游暂时不可达，请稍后重试")
+            return _error_response(503, "上游暂时不可达，请稍后重试", error_type="upstream_unreachable")
 
-        except Exception as e:
+        except Exception:
             elapsed = int((time.monotonic() - t0) * 1000)
-            logger.error("[%s %s] 代理异常：%s（ms=%d）", request.method, target_path, e, elapsed)
-            if attempt < max_retries - 1:
-                try:
-                    await session_mgr.force_relogin()
-                except Exception as login_err:
-                    logger.error("[%s %s] 重登失败：%s", request.method, target_path, login_err)
-                await asyncio.sleep(1)
-                continue
-            return _error_response(502, str(e))
+            logger.exception("代理异常（ms=%d）", elapsed)
+            return _error_response(502, "代理异常", error_type="proxy_error")
 
-    return _error_response(502, "代理请求失败")
+    return _error_response(502, "代理请求失败", error_type="proxy_exhausted")
 
 
-def _error_response(status_code: int, message: str) -> Response:
-    return Response(
-        content=json.dumps({"error": message}),
-        status_code=status_code,
-        media_type="application/json",
-    )
+def _error_response(status_code: int, message: str, *, error_type: str | None = None) -> Response:
+    body: dict = {"error": message}
+    if error_type:
+        body["type"] = error_type
+    return Response(content=json.dumps(body, ensure_ascii=False), status_code=status_code, media_type="application/json")
 
 
 # ============================================================
@@ -736,53 +848,22 @@ def _error_response(status_code: int, message: str) -> Response:
 # ============================================================
 
 
-@app.get("/v1")
-@app.get("/v1/")
-async def v1_index():
-    """直接访问 /v1 时返回友好提示而非走代理"""
-    return {
-        "message": "NWAFU DeepSeek Proxy — /v1 API 端点",
-        "endpoints": {
-            "models": "/v1/models",
-            "chat": "/v1/chat/completions",
-            "embeddings": "/v1/embeddings",
-        },
-        "ui": "/",
-        "note": "客户端 API Key 可填任意值，代理会自动替换",
-    }
+_PROXY_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
+_PROXY_PREFIXES = ("v1", "api", "ollama", "openai")
 
 
-@app.get("/v1/chat/completions")
-async def proxy_v1_chat_get():
-    """显式拦截对聊天 API 的非规范 GET 测试，返回更标准友好的错误"""
-    return _error_response(405, "Method Not Allowed. Please use POST for /v1/chat/completions.")
+def _register_proxy_routes(app: FastAPI) -> None:
+    for prefix in _PROXY_PREFIXES:
+        _mount_proxy_prefix(app, prefix)
 
 
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-async def proxy_v1(request: Request, path: str):
-    if path == "chat/completions" and request.method == "GET":
-        return _error_response(405, "Method Not Allowed. Please use POST for /v1/chat/completions.")
-    return await _proxy_request(request, f"/v1/{path}")
+def _mount_proxy_prefix(app: FastAPI, prefix: str) -> None:
+    @app.api_route(f"/{prefix}/{{path:path}}", methods=_PROXY_METHODS)
+    async def _handler(request: Request, path: str):  # noqa: ANN001 - FastAPI 注入
+        return await _proxy_request(request, f"/{prefix}/{path}")
 
 
-@app.api_route("/api/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-async def proxy_api_v1(request: Request, path: str):
-    return await _proxy_request(request, f"/api/v1/{path}")
-
-
-@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-async def proxy_api(request: Request, path: str):
-    return await _proxy_request(request, f"/api/{path}")
-
-
-@app.api_route("/ollama/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-async def proxy_ollama(request: Request, path: str):
-    return await _proxy_request(request, f"/ollama/{path}")
-
-
-@app.api_route("/openai/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-async def proxy_openai(request: Request, path: str):
-    return await _proxy_request(request, f"/openai/{path}")
+_register_proxy_routes(app)
 
 
 # ============================================================
@@ -791,24 +872,30 @@ async def proxy_openai(request: Request, path: str):
 
 if __name__ == "__main__":
     api_key_hint = "已配置" if OPENWEBUI_API_KEY else "未配置"
-    print(f"""
-  NWAFU DeepSeek Proxy (transparent reverse proxy)
-  ------------------------------------------------
-  Listen:     http://localhost:{PROXY_PORT}/v1
-  Upstream:   {TARGET_BASE}
-  AuthServer: {AUTH_SERVER}
-  User:       {USERNAME}
-  WebUI Key:  {api_key_hint}
-
-  Note:
-    - 代理透明转发所有 /v1/* 请求到源站
-    - 客户端 API Key 可填任意值（代理会注入真实 Open WebUI Key）
-""")
+    logger.info(
+        "\n  NWAFU DeepSeek Proxy (transparent reverse proxy)\n"
+        "  ------------------------------------------------\n"
+        "  Listen:     http://localhost:%s/v1\n"
+        "  Upstream:   %s\n"
+        "  AuthServer: %s\n"
+        "  User:       %s\n"
+        "  WebUI Key:  %s\n\n"
+        "  Note:\n"
+        "    - 代理透明转发所有 /v1/* 请求到源站\n"
+        "    - 客户端 API Key 可填任意值（代理会注入真实 Open WebUI Key）\n",
+        PROXY_PORT,
+        TARGET_BASE,
+        AUTH_SERVER,
+        USERNAME,
+        api_key_hint,
+    )
 
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=PROXY_PORT,
         log_level="info",
+        access_log=False,
+        log_config=None,
         timeout_graceful_shutdown=2,
     )
