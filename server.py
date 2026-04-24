@@ -765,10 +765,9 @@ async def proxy_v1(request: Request, path: str):
     return await _proxy_request(request, f"/v1/{path}")
 
 
-@app.api_route("/api/v1/usage", methods=["GET"])
-async def proxy_api_v1_usage(request: Request):
-    """Open WebUI 用量统计"""
-    return await _proxy_request(request, "/api/v1/usage")
+@app.api_route("/api/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def proxy_api_v1(request: Request, path: str):
+    return await _proxy_request(request, f"/api/v1/{path}")
 
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
