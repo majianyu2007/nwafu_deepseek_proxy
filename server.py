@@ -105,6 +105,10 @@ def encrypt_password(password: str, salt: str) -> str:
 # ============================================================
 
 
+class UpstreamUnavailableError(Exception):
+    """上游暂不可用（用于登录冷却/抖动期间的降级响应）"""
+
+
 class AuthSessionManager:
     """
     管理与 AuthServer 及目标站之间的完整会话生命周期:
@@ -120,6 +124,9 @@ class AuthSessionManager:
         self._login_ok: bool = False
         self._cookie_ttl: float = 25 * 60
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._login_inflight: Optional[asyncio.Future] = None
+        self._last_login_failure: float = 0
+        self._login_cooldown: float = 5.0
 
     @property
     def login_ok(self) -> bool:
@@ -143,27 +150,78 @@ class AuthSessionManager:
 
     async def ensure_login(self) -> httpx.AsyncClient:
         """确保已登录且 Cookie 有效, 返回可用的 client"""
-        async with self._lock:
-            now = time.monotonic()
-            needs_login = (
-                not self._login_ok
-                or self._client is None
-                or (now - self._last_login_time) > self._cookie_ttl
-            )
-            if needs_login:
-                await self._do_login()
+        now = time.monotonic()
+        if self._login_ok and self._client is not None and (now - self._last_login_time) <= self._cookie_ttl:
             return self._client
+        return await self._login_once(reason="ensure_login")
 
     async def force_relogin(self):
         """强制重新登录 (当检测到认证失效时调用)"""
+        logger.warning("会话可能已失效，准备重新登录")
+        self._login_ok = False
+        await self._login_once(reason="force_relogin")
+
+    async def _login_once(self, *, reason: str) -> httpx.AsyncClient:
+        """
+        登录去重 + 失败冷却：
+        - 并发情况下仅允许一个登录在途，其余 await 同一个 future
+        - 最近一次登录失败后短时间内直接拒绝，避免登录风暴
+        """
         async with self._lock:
-            logger.warning("会话可能已失效，准备重新登录")
-            self._login_ok = False
+            now = time.monotonic()
+            if self._login_ok and self._client is not None and (now - self._last_login_time) <= self._cookie_ttl:
+                return self._client
+
+            if self._login_inflight is not None and not self._login_inflight.done():
+                fut = self._login_inflight
+            else:
+                since_fail = now - self._last_login_failure
+                if since_fail < self._login_cooldown:
+                    raise UpstreamUnavailableError(
+                        f"登录冷却中（原因={reason}，剩余 {self._login_cooldown - since_fail:.1f}s）"
+                    )
+
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                self._login_inflight = fut
+                asyncio.create_task(self._run_login(fut))
+
+        return await fut
+
+    async def _run_login(self, fut: asyncio.Future):
+        try:
             await self._do_login()
+            fut.set_result(self._client)
+        except Exception as e:
+            self._last_login_failure = time.monotonic()
+            if not fut.done():
+                fut.set_exception(e)
+        finally:
+            async with self._lock:
+                if self._login_inflight is fut:
+                    self._login_inflight = None
 
     async def _do_login(self):
         """执行完整的金智 AuthServer 登录流程"""
         logger.info("开始统一身份认证登录（AuthServer CAS）")
+
+        async def _sleep_backoff(attempt: int):
+            await asyncio.sleep(1.0 * (2 ** attempt))
+
+        async def _request_with_retry(method: str, url: str, **kwargs) -> httpx.Response:
+            last_exc: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    return await self._client.request(method, url, **kwargs)
+                except (httpx.ConnectError, httpx.NetworkError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                    last_exc = e
+                    if attempt < 2:
+                        logger.warning("登录阶段网络异常（%s %s）：%s，准备重试", method, str(url)[:60], e)
+                        await _sleep_backoff(attempt)
+                        continue
+                    raise
+            assert last_exc is not None
+            raise last_exc
 
         if self._client:
             try:
@@ -183,7 +241,7 @@ class AuthSessionManager:
             login_url = f"{AUTH_SERVER}/authserver/login?service={encoded_service}"
 
             logger.info("请求登录页：GET %s...", login_url[:80])
-            resp = await self._client.get(login_url, follow_redirects=False)
+            resp = await _request_with_retry("GET", login_url, follow_redirects=False)
 
             if resp.status_code in (301, 302):
                 location = resp.headers.get("location", "")
@@ -226,7 +284,8 @@ class AuthSessionManager:
             }
 
             logger.info("提交登录表单：POST /authserver/login")
-            resp = await self._client.post(
+            resp = await _request_with_retry(
+                "POST",
                 login_url,
                 data=login_data,
                 follow_redirects=False,
@@ -281,7 +340,24 @@ class AuthSessionManager:
                 break
 
             logger.info("跟随重定向[%d/%d]：%s...", i + 1, max_redirects, current_url[:80])
-            resp = await self._client.get(current_url, follow_redirects=False)
+            # 这里很容易遇到瞬时网络抖动，做轻量退避重试
+            last_exc: Optional[Exception] = None
+            resp: Optional[httpx.Response] = None
+            for attempt in range(3):
+                try:
+                    resp = await self._client.get(current_url, follow_redirects=False)
+                    last_exc = None
+                    break
+                except (httpx.ConnectError, httpx.NetworkError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                    last_exc = e
+                    if attempt < 2:
+                        logger.warning("重定向链网络异常：%s，准备重试", e)
+                        await asyncio.sleep(1.0 * (2 ** attempt))
+                        continue
+                    raise
+
+            if resp is None and last_exc is not None:
+                raise last_exc
 
             if resp.status_code in (301, 302):
                 current_url = resp.headers.get("location", "")
@@ -492,7 +568,18 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
             pass
 
     for attempt in range(max_retries):
-        client = await session_mgr.ensure_login()
+        # 先确保已登录。登录失败应返回干净的 503，而不是抛出到 ASGI
+        try:
+            client = await session_mgr.ensure_login()
+        except UpstreamUnavailableError as e:
+            logger.warning("[%s %s] 登录被冷却拒绝：%s", request.method, target_path, e)
+            return _error_response(503, "上游暂时不可达，请稍后重试")
+        except (httpx.ConnectError, httpx.NetworkError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+            logger.warning("[%s %s] 登录阶段网络异常：%s", request.method, target_path, e)
+            return _error_response(503, "上游暂时不可达，请稍后重试")
+        except Exception as e:
+            logger.error("[%s %s] 登录失败：%s", request.method, target_path, e)
+            return _error_response(503, "登录失败，请稍后重试")
 
         target_url = f"{TARGET_BASE}{target_path}"
         if request.url.query:
@@ -606,11 +693,29 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
                 continue
             return _error_response(504, "上游请求超时")
 
+        except (httpx.ConnectError, httpx.NetworkError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+            # 网络错误：不动 session，不触发重登；仅对该请求做退避重试
+            elapsed = int((time.monotonic() - t0) * 1000)
+            logger.warning(
+                "[%s %s] 上游网络抖动：%s（ms=%d）",
+                request.method,
+                target_path,
+                e,
+                elapsed,
+            )
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            return _error_response(503, "上游暂时不可达，请稍后重试")
+
         except Exception as e:
             elapsed = int((time.monotonic() - t0) * 1000)
             logger.error("[%s %s] 代理异常：%s（ms=%d）", request.method, target_path, e, elapsed)
             if attempt < max_retries - 1:
-                await session_mgr.force_relogin()
+                try:
+                    await session_mgr.force_relogin()
+                except Exception as login_err:
+                    logger.error("[%s %s] 重登失败：%s", request.method, target_path, login_err)
                 await asyncio.sleep(1)
                 continue
             return _error_response(502, str(e))
