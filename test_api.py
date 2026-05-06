@@ -14,7 +14,7 @@ async def main():
 
     # 如果没有指定模型, 先查询可用列表
     if not model:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             resp = await client.get(
                 f"{API_BASE}/models",
                 headers={"Authorization": "Bearer sk-any"},
@@ -41,7 +41,7 @@ async def main():
 
     print(f"请求 {API_BASE}/chat/completions (model={model}) ...")
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=120.0, trust_env=False) as client:
         async with client.stream(
             "POST",
             f"{API_BASE}/chat/completions",

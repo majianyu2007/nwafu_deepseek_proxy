@@ -7,7 +7,7 @@ API_BASE = "http://localhost:8000"
 
 
 async def main():
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
         resp = await client.get(
             f"{API_BASE}/v1/models",
             headers={"Authorization": "Bearer sk-any"},

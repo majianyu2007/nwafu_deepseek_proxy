@@ -247,6 +247,7 @@ class AuthSessionManager:
         return httpx.AsyncClient(
             timeout=DEFAULT_TIMEOUT,
             follow_redirects=True,
+            trust_env=False,
             limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
             headers={
                 "User-Agent": (
