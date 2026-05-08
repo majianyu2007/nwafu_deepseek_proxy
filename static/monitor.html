@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NWAFU 模型监控</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0a0f; --surface: #12121a; --surface2: #1a1a26;
+  --border: #2a2a3a; --fg: #e0e0ee; --dim: #7a7a8e;
+  --accent: #6c5ce7; --accent-glow: rgba(108,92,231,.25);
+  --green: #00d68f; --green-bg: rgba(0,214,143,.08);
+  --red: #ff6b6b; --red-bg: rgba(255,107,107,.08);
+  --blue: #4ecdc4; --orange: #ffa726;
+  --radius: 12px; --radius-sm: 8px;
+  --shadow: 0 4px 20px rgba(0,0,0,.3);
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f5f7; --surface: #ffffff; --surface2: #f0f0f2;
+    --border: #d8d8dc; --fg: #1d1d1f; --dim: #86868b;
+    --accent: #5847d4; --accent-glow: rgba(88,71,212,.12);
+    --green: #00a86b; --green-bg: rgba(0,168,107,.08);
+    --red: #e04848; --red-bg: rgba(224,72,72,.06);
+    --blue: #2aa89e; --orange: #e08f1a;
+    --shadow: 0 4px 20px rgba(0,0,0,.08);
+  }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--fg); min-height: 100vh; }
+
+/* Header */
+.header { padding: 24px 32px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;
+  background: linear-gradient(135deg, var(--surface) 0%, var(--bg) 100%); }
+.header h1 { font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+.header h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+.header-actions { display: flex; align-items: center; gap: 12px; }
+.badge { font-size: 12px; padding: 4px 10px; border-radius: 20px; background: var(--surface2); border: 1px solid var(--border); color: var(--dim); }
+.badge.live { background: var(--green-bg); border-color: var(--green); color: var(--green); }
+.btn { font-family: inherit; font-size: 13px; padding: 8px 16px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface2); color: var(--fg); cursor: pointer; transition: all .2s; display: inline-flex; align-items: center; gap: 6px; }
+.btn:hover { border-color: var(--accent); background: var(--accent-glow); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { filter: brightness(1.15); }
+
+/* Stats bar */
+.stats { display: flex; gap: 16px; padding: 16px 32px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.stat-card { flex: 1; min-width: 140px; padding: 16px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); }
+.stat-card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); margin-bottom: 6px; }
+.stat-card .value { font-size: 24px; font-weight: 700; }
+.stat-card .value.green { color: var(--green); }
+.stat-card .value.blue { color: var(--blue); }
+.stat-card .value.orange { color: var(--orange); }
+
+/* Main grid */
+.main { display: grid; grid-template-columns: 1fr 360px; gap: 0; min-height: calc(100vh - 180px); }
+@media (max-width: 900px) { .main { grid-template-columns: 1fr; } }
+
+/* Model list */
+.model-list { padding: 24px 32px; border-right: 1px solid var(--border); }
+.model-list h2 { font-size: 15px; font-weight: 600; margin-bottom: 16px; color: var(--dim); }
+.model-grid { display: flex; flex-direction: column; gap: 10px; }
+.model-card { padding: 16px 18px; border-radius: var(--radius); background: var(--surface); border: 1px solid var(--border); transition: all .25s; cursor: default; }
+.model-card:hover { border-color: var(--accent); transform: translateY(-1px); box-shadow: var(--shadow); }
+.model-card .top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.model-card .name { font-weight: 600; font-size: 14px; }
+.model-card .type-tag { font-size: 11px; padding: 2px 8px; border-radius: 12px; }
+.type-chat { background: rgba(108,92,231,.15); color: var(--accent); }
+.type-embedding { background: rgba(78,205,196,.15); color: var(--blue); }
+.type-rerank { background: rgba(255,167,38,.15); color: var(--orange); }
+.model-card .caps { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.cap { font-size: 11px; padding: 2px 8px; border-radius: 6px; background: var(--surface2); color: var(--dim); border: 1px solid var(--border); }
+.cap.active { color: var(--green); border-color: rgba(0,214,143,.3); background: var(--green-bg); }
+.model-card .meta { font-size: 11px; color: var(--dim); margin-top: 8px; }
+
+/* Change log */
+.changelog { padding: 24px; overflow-y: auto; }
+.changelog h2 { font-size: 15px; font-weight: 600; margin-bottom: 16px; color: var(--dim); }
+.change-item { padding: 12px 14px; border-radius: var(--radius-sm); background: var(--surface); border: 1px solid var(--border); margin-bottom: 8px; animation: slideIn .3s ease; }
+@keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+.change-item .time { font-size: 11px; color: var(--dim); margin-bottom: 6px; }
+.change-item .added { color: var(--green); font-size: 13px; }
+.change-item .removed { color: var(--red); font-size: 13px; }
+.empty { color: var(--dim); font-size: 13px; text-align: center; padding: 40px 20px; }
+
+/* Toast */
+.toast-container { position: fixed; top: 20px; right: 20px; z-index: 1000; display: flex; flex-direction: column; gap: 8px; }
+.toast { padding: 12px 18px; border-radius: var(--radius-sm); color: var(--fg); font-size: 13px; animation: toastIn .3s ease; max-width: 360px;
+  background: var(--surface); border: 1px solid var(--border); backdrop-filter: blur(10px); box-shadow: var(--shadow); }
+.toast.success { border-color: var(--green); }
+.toast.info { border-color: var(--accent); }
+@keyframes toastIn { from { opacity: 0; transform: translateY(-10px); } }
+
+/* Notification permission */
+.notif-bar { padding: 10px 32px; background: var(--accent-glow); border-bottom: 1px solid var(--accent); display: flex; align-items: center; justify-content: space-between; }
+.notif-bar.hidden { display: none; }
+.notif-bar span { font-size: 13px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span class="dot" id="statusDot"></span> NWAFU 模型监控</h1>
+  <div class="header-actions">
+    <span class="badge" id="sseBadge">连接中…</span>
+    <button class="btn" id="notifBtn" onclick="requestNotifPermission()">🔔 开启通知</button>
+    <button class="btn" onclick="manualPoll()">🔄 立即检查</button>
+    <a href="/" class="btn">💬 聊天</a>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat-card"><div class="label">模型总数</div><div class="value green" id="totalModels">—</div></div>
+  <div class="stat-card"><div class="label">上次轮询</div><div class="value blue" id="lastPoll">—</div></div>
+  <div class="stat-card"><div class="label">变更次数</div><div class="value orange" id="changeCount">0</div></div>
+  <div class="stat-card"><div class="label">SSE 连接</div><div class="value" id="sseClients">—</div></div>
+</div>
+
+<div class="main">
+  <div class="model-list">
+    <h2>📋 可用模型</h2>
+    <div class="model-grid" id="modelGrid"><div class="empty">加载中…</div></div>
+  </div>
+  <div class="changelog">
+    <h2>📜 变更记录</h2>
+    <div id="changeLog"><div class="empty">暂无变更记录</div></div>
+  </div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<script>
+const modelGrid = document.getElementById('modelGrid');
+const changeLog = document.getElementById('changeLog');
+const sseBadge = document.getElementById('sseBadge');
+const statusDot = document.getElementById('statusDot');
+const notifBtn = document.getElementById('notifBtn');
+let evtSource = null;
+
+// ---- SSE ----
+function connectSSE() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource('/monitor/sse');
+  evtSource.onopen = () => {
+    sseBadge.textContent = '🟢 实时连接';
+    sseBadge.className = 'badge live';
+    statusDot.style.background = 'var(--green)';
+  };
+  evtSource.onerror = () => {
+    sseBadge.textContent = '🔴 已断开';
+    sseBadge.className = 'badge';
+    statusDot.style.background = 'var(--red)';
+    setTimeout(connectSSE, 5000);
+  };
+  evtSource.addEventListener('snapshot', e => {
+    const d = JSON.parse(e.data);
+    renderModels(d.models);
+    document.getElementById('totalModels').textContent = d.total;
+    document.getElementById('lastPoll').textContent = fmtTime(d.timestamp);
+  });
+  evtSource.addEventListener('model_change', e => {
+    const d = JSON.parse(e.data);
+    addChangeEntry(d);
+    showToast(d.summary.split('\n').slice(2).join(' ').trim(), 'success');
+    browserNotify(d.summary);
+  });
+}
+
+// ---- Render ----
+function renderModels(models) {
+  if (!models.length) { modelGrid.innerHTML = '<div class="empty">暂无模型</div>'; return; }
+  modelGrid.innerHTML = models.map(m => {
+    const typeClass = 'type-' + m.model_type;
+    const typeLabel = {chat:'大语言模型',embedding:'嵌入模型',rerank:'重排模型'}[m.model_type] || m.model_type;
+    const caps = Object.entries(m.capabilities||{}).map(([k,v]) =>
+      `<span class="cap ${v?'active':''}">${capName(k)}</span>`
+    ).join('');
+    const updated = m.updated_at ? '更新于 ' + fmtTime(m.updated_at) : '';
+    return `<div class="model-card">
+      <div class="top">
+        <span class="name">${m.type_emoji} ${m.id}</span>
+        <span class="type-tag ${typeClass}">${typeLabel}</span>
+      </div>
+      ${m.tags.length ? '<div style="margin-bottom:4px"><span class="cap">' + m.tags.join('</span> <span class="cap">') + '</span></div>' : ''}
+      <div class="caps">${caps}</div>
+      <div class="meta">${updated}</div>
+    </div>`;
+  }).join('');
+}
+
+function addChangeEntry(d) {
+  if (changeLog.querySelector('.empty')) changeLog.innerHTML = '';
+  const el = document.createElement('div');
+  el.className = 'change-item';
+  let html = `<div class="time">⏰ ${fmtTime(d.timestamp)}</div>`;
+  d.added.forEach(m => html += `<div class="added">🟢 + ${m.id} [${m.model_type}]</div>`);
+  d.removed.forEach(m => html += `<div class="removed">🔴 - ${m.id} [${m.model_type}]</div>`);
+  el.innerHTML = html;
+  changeLog.prepend(el);
+  const cnt = document.getElementById('changeCount');
+  cnt.textContent = parseInt(cnt.textContent || '0') + 1;
+}
+
+// ---- Helpers ----
+function capName(k) {
+  return {vision:'👁视觉',code_interpreter:'💻代码',web_search:'🔍搜索',image_generation:'🎨绘图',file_upload:'📎文件'}[k] || k;
+}
+function fmtTime(ts) {
+  if (!ts || ts < 1e8) return '—';
+  const d = new Date(ts * 1000);
+  return `${d.getMonth()+1}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+}
+function showToast(msg, type='info') {
+  const t = document.createElement('div');
+  t.className = 'toast ' + type;
+  t.textContent = msg;
+  document.getElementById('toasts').appendChild(t);
+  setTimeout(() => t.remove(), 6000);
+}
+
+// ---- Browser Notification ----
+function requestNotifPermission() {
+  if (!('Notification' in window)) { showToast('浏览器不支持通知'); return; }
+  Notification.requestPermission().then(p => {
+    if (p === 'granted') { notifBtn.textContent = '🔔 通知已开启'; showToast('浏览器通知已开启', 'success'); }
+    else { showToast('通知权限被拒绝'); }
+  });
+}
+function browserNotify(text) {
+  if (Notification.permission === 'granted') {
+    new Notification('NWAFU 模型变更', { body: text.substring(0, 200), icon: '📢' });
+  }
+}
+if ('Notification' in window && Notification.permission === 'granted') {
+  notifBtn.textContent = '🔔 通知已开启';
+}
+
+// ---- API ----
+async function manualPoll() {
+  try {
+    const r = await fetch('/monitor/poll', { method: 'POST' });
+    const d = await r.json();
+    showToast(d.changed ? '检测到变更！' : '未检测到变更', d.changed ? 'success' : 'info');
+  } catch(e) { showToast('请求失败: ' + e.message); }
+}
+async function loadInitial() {
+  try {
+    const r = await fetch('/monitor/snapshot');
+    const d = await r.json();
+    renderModels(d.models);
+    document.getElementById('totalModels').textContent = d.total;
+    document.getElementById('lastPoll').textContent = fmtTime(d.timestamp);
+  } catch(e) {}
+  try {
+    const r = await fetch('/monitor/history');
+    const list = await r.json();
+    list.forEach(addChangeEntry);
+  } catch(e) {}
+  try {
+    const r = await fetch('/monitor/status');
+    const d = await r.json();
+    document.getElementById('sseClients').textContent = d.sse_clients;
+    document.getElementById('changeCount').textContent = d.history_count;
+  } catch(e) {}
+}
+
+loadInitial();
+connectSSE();
+setInterval(async () => {
+  try {
+    const r = await fetch('/monitor/status');
+    const d = await r.json();
+    document.getElementById('sseClients').textContent = d.sse_clients;
+  } catch(e) {}
+}, 15000);
+</script>
+</body>
+</html>

@@ -2,17 +2,18 @@
 
 西北农林科技大学校园网自部署大模型代理服务。
 
-学校通过 [Open WebUI](https://github.com/open-webui/open-webui) 部署了 DeepSeek / Qwen 系列大模型，但前方架设了金智教育（Wisedu）统一身份认证网关，所有请求都会被拦截跳转至 AuthServer 登录页面。这意味着你没法直接拿到可用的 API 地址——即使拼上了正确的 token，请求也会在中间件层被 302 到 CAS 登录。
+学校通过 [Open WebUI](https://github.com/open-webui/open-webui) 部署了 DeepSeek / Qwen 系列大模型，但前方架设了金智教育（Wisedu）统一身份认证网关，所有请求都会被拦截跳转至 AuthServer 登录页面。因此，客户端无法直接使用源站 API 地址；即使携带正确 token，请求也可能在中间件层被 302 到 CAS 登录。
 
 本项目通过在本地运行一个 **透明反向代理** 来解决该问题：
 
 1. 启动时自动完成 CAS 认证（包括 AES 密码加密、表单提交、ticket 兑换）
 2. 获取到目标站点的有效 session cookie
-3. 在本地暴露 `http://localhost:8000/v1`，**透明转发所有请求到源站**
+3. 在本地暴露 `http://localhost:8000`，**透明转发所有请求到源站**
 4. 所有经过代理的请求会自动附带 CAS cookie + Open WebUI API Key
 5. 后台定时保活，cookie 过期时自动刷新
+6. 多层账号保护机制：状态机、单飞锁、频率限制、指数退避、熔断器
 
-代理不对任何 API 端点做特殊处理；源站支持的能力将被原样透传。将 API 地址指向 `localhost:8000/v1` 后，即可在 Chatbox、LobeChat 等第三方客户端中正常使用学校的模型。
+代理不对任何请求做特殊处理；源站支持的能力将被原样透传。直接将浏览器指向 `localhost:8000` 即可使用完整的 Open WebUI，包括聊天、模型管理等功能。
 
 ## 快速开始
 
@@ -87,26 +88,27 @@ python test_api.py
 python test_api.py Qwen3-235B-A22B
 ```
 
-### 支持的 API 端点
+### 支持的端点
 
-所有 `/v1/*` 路径都会被透明转发到源站。常用端点包括：
+代理会透明转发所有请求到源站，不限于以下端点：
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/v1/models` | GET | 查看全部可用模型 |
-| `/v1/chat/completions` | POST | 对话补全（支持流式） |
-| `/v1/embeddings` | POST | 向量嵌入 |
-| `/v1/rerank` | POST | 文档重排序（需源站支持） |
-| `/v1/*` | * | 源站支持的任何其它端点 |
-
-> 代理不对请求/响应做任何业务层修改，行为由源站能力决定。
+| 端点 | 说明 |
+|------|------|
+| `/` | Open WebUI 完整界面 |
+| `/v1/models` | 查看全部可用模型 |
+| `/v1/chat/completions` | 对话补全（支持流式） |
+| `/v1/embeddings` | 向量嵌入 |
+| `/v1/rerank` | 文档重排序（需源站支持） |
+| `/api/*` | Open WebUI 内部 API |
+| 任何其它路径 | 源站支持的任何其它端点 |
 
 ## 客户端配置
 
-在你使用的 LLM 客户端中：
+**直接使用 Open WebUI：** 浏览器访问 `http://localhost:8000` 即可。
 
+**第三方 LLM 客户端：**
 - **API 地址** / **API Base**: `http://localhost:8000/v1`
-- **API Key**: 填任意值（如 `sk-local`），代理内部会替换为真实 key
+- **API Key**: 填写占位值（如 `sk-local`），代理内部会替换为真实 key
 
 ### 推荐的客户端
 
@@ -122,15 +124,16 @@ python test_api.py Qwen3-235B-A22B
 ## 工作原理
 
 ```
-第三方客户端 (Chatbox / LobeChat / curl / ...)
+浏览器 / 第三方客户端 (Chatbox / LobeChat / curl / ...)
         │
-        │  任意 /v1/* 请求
+        │  任意请求（/ 及所有子路径）
         ▼
 localhost:8000  ← 本地 FastAPI 透明反向代理
         │
         │  ① 注入 CAS session cookie
         │  ② 注入 Authorization: Bearer sk-xxx
         │  ③ 透明转发, 不修改请求/响应内容
+        │  ④ 重写 Location / Origin / Referer 头
         ▼
 deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
         │
@@ -150,10 +153,36 @@ deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
 
 ### Cookie 保活
 
-- 每 5 分钟向目标站发送轻量 HEAD 心跳请求
+- 每 ~5 分钟（含随机抖动）向目标站发送轻量 HEAD 心跳请求
 - 25 分钟无活动主动刷新
 - 检测到认证失效时自动重新认证（精确区分 CAS 失效与上游业务错误）
-- 对客户端完全透明，无需手动干预
+- 网络异常或上游故障时**不会**触发重新登录（避免误判导致账号锁定）
+
+### 账号保护机制
+
+代理内置多层保护，防止上游异常时频繁登录导致校园账号被锁定：
+
+| 层级 | 机制 | 说明 |
+|------|------|------|
+| 1 | 状态机 | 区分"上游异常"(SUSPECT)与"认证过期"(EXPIRED)，只有后者才触发登录 |
+| 2 | 单飞锁 | 并发请求最多触发一次真实 CAS 登录 |
+| 3 | 频率限制 | 每小时最多 6 次登录尝试（持久化到 `.data/`） |
+| 4 | 指数退避 | 登录失败后退避时间递增（5s → 20s → 80s → 15min） |
+| 5 | 熔断器 | 连续 3 次失败后熔断 15 分钟 – 6 小时 |
+| 6 | 失败分类 | 账号锁定/验证码/密码错误等高风险错误直接触发最长熔断 |
+
+熔断期间，代理会返回 `503` 并附带 `Retry-After` 头，明确告知客户端当前处于账号保护模式。
+
+## 模型变更监控（可选）
+
+在 `.env` 中设置 `MONITOR_ENABLED=true` 可启用模型变更监控功能：
+
+- 定期轮询模型列表，检测新模型上线或模型下线
+- 支持多渠道通知：Telegram Bot、自定义 Webhook
+- 提供实时 SSE 推送和 Web 监控面板（`/monitor`）
+- 内置安全保护：仅在认证正常时轮询，不会在代理熔断期间触发登录
+
+相关配置项见下方 `MONITOR_*` 系列。
 
 ## 配置项一览
 
@@ -165,6 +194,13 @@ deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
 | `PROXY_PORT` | | `8000` | 代理监听端口 |
 | `TARGET_HOST` | | `deepseek.nwafu.edu.cn` | 目标 Open WebUI 域名 |
 | `AUTH_SERVER` | | `https://authserver.nwafu.edu.cn` | AuthServer 地址 |
+| `MONITOR_ENABLED` | | `false` | 启用模型变更监控 |
+| `MONITOR_POLL_INTERVAL` | | `600` | 监控轮询间隔（秒，最小 300） |
+| `TELEGRAM_BOT_TOKEN` | | — | Telegram Bot Token |
+| `TELEGRAM_CHAT_ID` | | — | Telegram Chat ID |
+| `WEBHOOK_URLS` | | — | Webhook URL（多个用逗号分隔） |
+| `WEBHOOK_SECRET` | | — | Webhook 签名密钥 |
+| `NOTIFY_PROXY` | | — | 通知渠道 HTTP 代理 |
 
 ## 常见问题
 

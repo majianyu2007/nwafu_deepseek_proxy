@@ -1,7 +1,7 @@
 # NWAFU DeepSeek Proxy - Agent Instructions
 
 ## Project Type
-Python FastAPI transparent reverse proxy that bypasses Wisedu CAS authentication for NWAFU's Open WebUI instance. All `/v1/*` requests are forwarded to the upstream as-is; the proxy only handles CAS session management and header injection.
+Python FastAPI transparent reverse proxy that bypasses Wisedu CAS authentication for NWAFU's Open WebUI instance. All requests are forwarded to the upstream as-is; the proxy only handles CAS session management and header injection.
 
 ## Core Commands
 
@@ -39,7 +39,11 @@ python test_api.py Qwen3-235B-A22B  # Specific model
    - `NWAFU_PASSWORD` - Auth password (wrap in quotes if contains `#`)
    - `OPENWEBUI_API_KEY` - From Open WebUI Settings / Account / API Keys
 
-3. Install dependencies:
+3. Optional:
+   - `MONITOR_ENABLED=true` - Enable model change monitoring
+   - `MONITOR_POLL_INTERVAL` - Poll interval in seconds (default 600, min 300)
+
+4. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
@@ -47,43 +51,49 @@ python test_api.py Qwen3-235B-A22B  # Specific model
 ## Architecture Facts
 
 **Entry points:**
-- `server.py` - Main FastAPI application (~550 lines, pure transparent proxy)
-- `GET /` - 轻量聊天界面（模型选择 + 流式对话，调用 `/v1/*`）
+- `server.py` - Main FastAPI application (~1300 lines, full reverse proxy)
+- `utils/model_monitor.py` - Optional model change monitor (enabled via `MONITOR_ENABLED=true`)
 - `list_models.py` - Model listing utility
 - `test_api.py` - End-to-end connectivity test
 
 **Core flow:**
-1. Client -> `localhost:8000/v1/*` -> FastAPI proxy
+1. Client -> `localhost:8000/*` -> FastAPI proxy
 2. Proxy authenticates via CAS (AES-CBC password encryption)
 3. Transparently forwards ALL requests to `deepseek.nwafu.edu.cn` with valid session cookie + Bearer token
+4. Visiting `localhost:8000/` shows the full Open WebUI interface
 
-**Design principle:** The proxy is a transparent pass-through. It does NOT interpret, transform, or add business logic to any API endpoint. Every `/v1/*` path (chat, embeddings, rerank, models, audio, images, etc.) is forwarded identically to the upstream.
+**Auth state machine (replaces old `_login_ok` bool):**
+- `OK` — Session valid, normal operation
+- `SUSPECT` — Anomaly detected (network error, upstream issue), does NOT trigger login
+- `EXPIRED` — Definitive CAS redirect confirmed, needs re-login
+- `LOGIN_BACKOFF` — Consecutive failures, waiting with exponential backoff
+- `CIRCUIT_OPEN` — Too many failures, account protection active (15 min – 6 hours)
 
-**Key technical details:**
-- Password encryption: AES-CBC with PKCS7 padding, 64-char random prefix
-- CAS flow: GET login page -> extract `execution`/`salt` -> POST encrypted password -> follow 302 chain
-- Cookie keepalive: 5-minute heartbeat via HEAD request, 25-minute TTL threshold
-- Auth detection: 302 redirect to authserver, 401/403 with non-JSON body, or 200 with HTML content-type
-- Streaming: auto-detected via `stream: true` in request body, uses 5-minute read timeout
-- Auto-relogin on auth failure detection, with retry
+Only a definitive CAS login page redirect (exact host `authserver.nwafu.edu.cn`) can trigger re-login. All other errors → SUSPECT.
 
-**API endpoints (all transparently proxied):**
-- `/v1/models` - List available models
-- `/v1/chat/completions` - Chat (streaming supported)
-- `/v1/embeddings` - Vector embeddings
-- `/v1/rerank` - Document re-ranking (if supported by upstream)
-- `/v1/*` - Any other endpoint the upstream exposes
+**Login safety layers:**
+1. Failure classification (account lock → 6h circuit, captcha → 2h, password error → 1h)
+2. Circuit breaker (3 consecutive failures → CIRCUIT_OPEN)
+3. Exponential backoff (5s → 20s → 80s → 5min → 15min, with jitter)
+4. Rate limiting (max 6 logins/hour, persisted to `.data/login_state.json`)
+5. Single-flight lock (at most 1 real CAS login across concurrent requests)
+
+**Model monitor (optional):**
+- Only polls when auth state is OK
+- Never triggers CAS login
+- Notifies via Telegram / Webhook / SSE
+- Dashboard at `/monitor`
 
 ## Dependencies (requirements.txt)
 - fastapi, uvicorn, httpx - Core HTTP/server
 - pycryptodome - AES encryption
-- beautifulsoup4, lxml - HTML parsing for CAS login
 - python-dotenv - Environment loading
+- HTML parsing for CAS login uses stdlib regex only
 
 ## Testing Notes
 - API Key in requests can be arbitrary value (e.g., `sk-any`) - proxy replaces with real key
-- All endpoints are transparent proxies; behavior depends entirely on the upstream
 - Stream responses use 5-minute timeout; non-stream use 60-second timeout
+- Visit `http://localhost:8000/health` for health check (includes auth_state field)
 
 ## Network Requirements
 Must be able to reach:
