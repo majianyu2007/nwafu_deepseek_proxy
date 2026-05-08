@@ -19,7 +19,7 @@
 
 ### 环境要求
 
-- Python 3.9+（或 Docker）
+- Rust 1.80+（或 Docker）
 - 校园网环境（或 VPN）
 
 ### 安装
@@ -28,9 +28,7 @@
 git clone https://github.com/majianyu2007/nwafu_deepseek_proxy.git
 cd nwafu_deepseek_proxy
 
-python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+cargo build --release
 ```
 
 ### 配置
@@ -50,12 +48,14 @@ cp .env.example .env
 ### 启动
 
 ```bash
-python server.py
+cargo run --release
+# 或直接运行构建产物：
+./target/release/nwafu-deepseek-proxy
 ```
 
 ### Docker 部署
 
-如果不想配置 Python 环境，也可以用 Docker：
+如果不想配置 Rust 环境，也可以用 Docker：
 
 ```bash
 cp .env.example .env
@@ -77,15 +77,22 @@ docker compose down
 查看可用模型：
 
 ```bash
-python list_models.py
+curl http://localhost:8000/v1/models \
+  -H 'Authorization: Bearer sk-local'
 ```
 
-发送测试对话（自动选择第一个 chat 模型）：
+### Release 构建
+
+仓库包含 GitHub Actions workflow：`.github/workflows/release.yml`。
+
+- 推送 `v*` 标签时自动构建 Linux / macOS / Windows 二进制并发布到 GitHub Release
+- 也可在 GitHub Actions 页面手动触发构建，产物会作为 workflow artifacts 上传
+
+发布示例：
 
 ```bash
-python test_api.py
-# 或指定模型
-python test_api.py Qwen3-235B-A22B
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ### 支持的端点
@@ -128,11 +135,11 @@ python test_api.py Qwen3-235B-A22B
         │
         │  任意请求（/ 及所有子路径）
         ▼
-localhost:8000  ← 本地 FastAPI 透明反向代理
+localhost:8000  ← 本地 Axum 透明反向代理
         │
         │  ① 注入 CAS session cookie
         │  ② 注入 Authorization: Bearer sk-xxx
-        │  ③ 透明转发, 不修改请求/响应内容
+        │  ③ 透明转发请求，并按需重写本地代理相关响应头/文本 URL
         │  ④ 重写 Location / Origin / Referer 头
         ▼
 deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
@@ -151,38 +158,17 @@ deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
 4. 跟随 302 重定向链：AuthServer 到 CAS callback（携带 ST ticket）再到目标站
 5. 在重定向过程中收集 session cookie
 
-### Cookie 保活
-
-- 每 ~5 分钟（含随机抖动）向目标站发送轻量 HEAD 心跳请求
-- 25 分钟无活动主动刷新
-- 检测到认证失效时自动重新认证（精确区分 CAS 失效与上游业务错误）
-- 网络异常或上游故障时**不会**触发重新登录（避免误判导致账号锁定）
-
 ### 账号保护机制
 
 代理内置多层保护，防止上游异常时频繁登录导致校园账号被锁定：
 
 | 层级 | 机制 | 说明 |
 |------|------|------|
-| 1 | 状态机 | 区分"上游异常"(SUSPECT)与"认证过期"(EXPIRED)，只有后者才触发登录 |
+| 1 | 登录后拒绝抑制 | 登录成功后短时间内仍被认证中间件拒绝时，不连续触发 CAS 登录 |
 | 2 | 单飞锁 | 并发请求最多触发一次真实 CAS 登录 |
-| 3 | 频率限制 | 每小时最多 6 次登录尝试（持久化到 `.data/`） |
+| 3 | 频率限制 | 每小时最多 6 次登录尝试 |
 | 4 | 指数退避 | 登录失败后退避时间递增（5s → 20s → 80s → 15min） |
-| 5 | 熔断器 | 连续 3 次失败后熔断 15 分钟 – 6 小时 |
-| 6 | 失败分类 | 账号锁定/验证码/密码错误等高风险错误直接触发最长熔断 |
-
-熔断期间，代理会返回 `503` 并附带 `Retry-After` 头，明确告知客户端当前处于账号保护模式。
-
-## 模型变更监控（可选）
-
-在 `.env` 中设置 `MONITOR_ENABLED=true` 可启用模型变更监控功能：
-
-- 定期轮询模型列表，检测新模型上线或模型下线
-- 支持多渠道通知：Telegram Bot、自定义 Webhook
-- 提供实时 SSE 推送和 Web 监控面板（`/monitor`）
-- 内置安全保护：仅在认证正常时轮询，不会在代理熔断期间触发登录
-
-相关配置项见下方 `MONITOR_*` 系列。
+| 5 | 熔断器 | 连续 3 次失败后熔断 15 分钟 |
 
 ## 配置项一览
 
@@ -194,13 +180,6 @@ deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
 | `PROXY_PORT` | | `8000` | 代理监听端口 |
 | `TARGET_HOST` | | `deepseek.nwafu.edu.cn` | 目标 Open WebUI 域名 |
 | `AUTH_SERVER` | | `https://authserver.nwafu.edu.cn` | AuthServer 地址 |
-| `MONITOR_ENABLED` | | `false` | 启用模型变更监控 |
-| `MONITOR_POLL_INTERVAL` | | `600` | 监控轮询间隔（秒，最小 300） |
-| `TELEGRAM_BOT_TOKEN` | | — | Telegram Bot Token |
-| `TELEGRAM_CHAT_ID` | | — | Telegram Chat ID |
-| `WEBHOOK_URLS` | | — | Webhook URL（多个用逗号分隔） |
-| `WEBHOOK_SECRET` | | — | Webhook 签名密钥 |
-| `NOTIFY_PROXY` | | — | 通知渠道 HTTP 代理 |
 
 ## 常见问题
 
@@ -214,7 +193,7 @@ deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
 
 **Q: `Model not found`**
 
-运行 `python list_models.py` 查看实际可用的模型 ID，在客户端中使用正确的名称。
+访问 `http://localhost:8000/v1/models` 查看实际可用的模型 ID，在客户端中使用正确的名称。
 
 **Q: 需要校园网吗？**
 

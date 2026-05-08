@@ -1,14 +1,19 @@
-FROM python:3.12-slim
+FROM rust:1-bookworm AS builder
 
 WORKDIR /app
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+RUN cargo build --release
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+FROM debian:bookworm-slim
 
-COPY server.py .
-COPY utils ./utils
-COPY static ./static
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/nwafu-deepseek-proxy /usr/local/bin/nwafu-deepseek-proxy
 
 EXPOSE 8000
 
-CMD ["python", "server.py"]
+CMD ["nwafu-deepseek-proxy"]
