@@ -1419,6 +1419,8 @@ async def _proxy_websocket(client_ws: WebSocket, target_path: str):
                                 await upstream_ws.send(data["bytes"])
                         elif data["type"] == "websocket.disconnect":
                             break
+                except asyncio.CancelledError:
+                    raise
                 except WebSocketDisconnect:
                     pass
                 except websockets.exceptions.ConnectionClosed:
@@ -1433,6 +1435,8 @@ async def _proxy_websocket(client_ws: WebSocket, target_path: str):
                             await client_ws.send_text(message)
                         elif isinstance(message, bytes):
                             await client_ws.send_bytes(message)
+                except asyncio.CancelledError:
+                    raise
                 except websockets.exceptions.ConnectionClosed:
                     pass
                 except WebSocketDisconnect:
@@ -1440,8 +1444,27 @@ async def _proxy_websocket(client_ws: WebSocket, target_path: str):
                 except Exception as e:
                     logger.debug("WS upstream→client 关闭：%s", e)
 
-            await asyncio.gather(client_to_upstream(), upstream_to_client())
+            tasks = [
+                asyncio.create_task(client_to_upstream()),
+                asyncio.create_task(upstream_to_client()),
+            ]
+            try:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
+    except asyncio.CancelledError:
+        logger.debug("event=ws_proxy_cancelled path=%s", target_path)
     except websockets.exceptions.InvalidStatus as e:
         logger.warning("WS 上游拒绝（status=%d）：%s", e.response.status_code, target_path[:80])
         await client_ws.close(code=1013, reason="Upstream rejected WebSocket")
