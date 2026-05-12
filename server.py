@@ -173,6 +173,20 @@ def _sample_contains_cas_fields(body_bytes: bytes) -> bool:
     return "execution" in found and "pwdEncryptSalt" in found
 
 
+def _totp_window_remaining_seconds() -> int:
+    return 30 - (int(time.time()) % 30)
+
+
+async def _wait_for_stable_totp_window() -> None:
+    remaining = _totp_window_remaining_seconds()
+    if remaining <= 3:
+        await asyncio.sleep(remaining + 1)
+
+
+async def _wait_for_next_totp_window() -> None:
+    await asyncio.sleep(_totp_window_remaining_seconds() + 1)
+
+
 # ---- 流式端点识别 ----
 
 _STREAMING_PATH_PREFIXES = (
@@ -986,8 +1000,13 @@ class AuthSessionManager:
         # 移除可能混入的空格和换行
         secret = re.sub(r"\s+", "", secret)
         totp = pyotp.TOTP(secret)
+        await _wait_for_stable_totp_window()
         otp_code = totp.now()
-        logger.info("event=2fa_totp_generated code=%s****", otp_code[:2])
+        logger.info(
+            "event=2fa_totp_generated code=%s**** window_remaining=%ds",
+            otp_code[:2],
+            _totp_window_remaining_seconds(),
+        )
 
         # Step 3: 提交二次验证
         submit_body = {
@@ -1019,13 +1038,18 @@ class AuthSessionManager:
 
         if submit_data.get("code") != "reAuth_success":
             msg = submit_data.get("msg", submit_resp.text[:200])
-            # 如果 TOTP 码被拒，等 2s 后用新码重试一次（处理时钟漂移/码过期）
+            # 如果 TOTP 码被拒，等待下一个时间窗后用新码重试一次。
             if self._consecutive_failures == 0 and ("code" in msg.lower() or "fail" in msg.lower() or "error" in msg.lower()):
-                logger.warning("event=2fa_retry reason=TOTP码被拒，等2s后用新码重试 msg=%s", msg)
-                await asyncio.sleep(2)
-                new_code = pyotp.TOTP(secret).now()
+                logger.warning("event=2fa_retry reason=TOTP码被拒，等待下一个时间窗后用新码重试 msg=%s", msg)
+                await _wait_for_next_totp_window()
+                await _wait_for_stable_totp_window()
+                new_code = totp.now()
                 submit_body["otpCode"] = new_code
-                logger.info("event=2fa_retry new_code=%s****", new_code[:2])
+                logger.info(
+                    "event=2fa_retry new_code=%s**** window_remaining=%ds",
+                    new_code[:2],
+                    _totp_window_remaining_seconds(),
+                )
                 retry_resp = await self._retry_request(
                     "POST",
                     f"{AUTH_SERVER}/authserver/reAuthCheck/reAuthSubmit.do",
