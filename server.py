@@ -1611,11 +1611,29 @@ async def _proxy_websocket(client_ws: WebSocket, target_path: str):
     cookie_str = _get_cookie_header(http_client, target_url)
     if cookie_str:
         extra_headers["Cookie"] = cookie_str
+        logger.info("event=ws_cookie_present len=%d", len(cookie_str))
+    else:
+        logger.warning("event=ws_no_cookie url=%s", target_url)
+
+    # 转发客户端非逐跳头
+    _ws_skip_headers = {
+        "host", "connection", "upgrade", "sec-websocket-key",
+        "sec-websocket-version", "sec-websocket-extensions",
+        "sec-websocket-protocol", "origin", "user-agent",
+        "authorization", "cookie", "content-length",
+    }
+    for name, value in client_ws.headers.items():
+        if name.lower() not in _ws_skip_headers and name not in extra_headers:
+            extra_headers[name] = value
 
     subprotocol_header = client_ws.headers.get("sec-websocket-protocol", "")
     subprotocols = [p.strip() for p in subprotocol_header.split(",") if p.strip()] or None
 
-    logger.info("event=ws_proxy_connect path=%s", target_path)
+    logger.info(
+        "event=ws_proxy_connect path=%s headers=%s",
+        target_path,
+        list(extra_headers.keys()),
+    )
 
     try:
         async with websocket_connect(
