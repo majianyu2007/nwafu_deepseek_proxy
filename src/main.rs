@@ -374,39 +374,17 @@ impl AuthManager {
                 secret_bytes.len()
             ));
         }
+        // Step 3: 提交二次验证 (最多重试一次 TOTP 码)
+        wait_for_stable_totp_window().await;
+        let mut otp_code = generate_totp(&secret_bytes);
         info!(
-            "event=2fa_totp_generated secret_len={} first_byte={:02x}",
+            "event=2fa_totp_generated secret_len={} first_byte={:02x} window_remaining={}s",
             secret_bytes.len(),
-            secret_bytes[0]
+            secret_bytes[0],
+            totp_window_remaining_secs(),
         );
 
-        let otp_code = generate_totp(&secret_bytes);
-
-        // Step 3: 提交二次验证 (最多重试一次 TOTP 码)
-        let submit_body = [
-            ("service", service_url.to_string()),
-            ("reAuthType", "10".to_string()),
-            ("isMultifactor", "true".to_string()),
-            ("password", String::new()),
-            ("dynamicCode", String::new()),
-            ("uuid", String::new()),
-            ("answer1", String::new()),
-            ("answer2", String::new()),
-            ("otpCode", otp_code.to_string()),
-            ("skipTmpReAuth", "true".to_string()),
-        ];
-        let submit = || async {
-            self.client
-                .post(format!(
-                    "{}/authserver/reAuthCheck/reAuthSubmit.do",
-                    self.settings.auth_server
-                ))
-                .form(&submit_body)
-                .send()
-                .await
-        };
-
-        let mut resp = submit().await?;
+        let mut resp = self.submit_2fa_code(service_url, otp_code).await?;
         if resp.status() != reqwest::StatusCode::OK {
             return Err(anyhow!("2FA: submit failed, HTTP {}", resp.status()));
         }
@@ -414,21 +392,16 @@ impl AuthManager {
         let code = data.get("code").and_then(|v| v.as_str()).unwrap_or("");
 
         if code != "reAuth_success" {
-            // 重试一次
-            warn!("event=2fa_retry reason=first code rejected, retrying in 2s");
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let new_code = generate_totp(&secret_bytes);
-            let mut retry_body = submit_body;
-            retry_body[8].1 = new_code.to_string();
-            resp = self
-                .client
-                .post(format!(
-                    "{}/authserver/reAuthCheck/reAuthSubmit.do",
-                    self.settings.auth_server
-                ))
-                .form(&retry_body)
-                .send()
-                .await?;
+            // 重试一次：等待进入下一个 TOTP 时间窗，避免重复提交已被拒绝/已过期的口令。
+            warn!("event=2fa_retry reason=first code rejected, waiting for next TOTP window");
+            wait_for_next_totp_window().await;
+            wait_for_stable_totp_window().await;
+            otp_code = generate_totp(&secret_bytes);
+            info!(
+                "event=2fa_totp_regenerated window_remaining={}s",
+                totp_window_remaining_secs(),
+            );
+            resp = self.submit_2fa_code(service_url, otp_code).await?;
             if resp.status() != reqwest::StatusCode::OK {
                 return Err(anyhow!("2FA: retry submit failed, HTTP {}", resp.status()));
             }
@@ -448,6 +421,31 @@ impl AuthManager {
         self.follow_redirects(service_url).await?;
         info!("event=2fa_complete");
         Ok(())
+    }
+
+    async fn submit_2fa_code(&self, service_url: &str, otp_code: u32) -> Result<reqwest::Response> {
+        let submit_body = [
+            ("service", service_url.to_string()),
+            ("reAuthType", "10".to_string()),
+            ("isMultifactor", "true".to_string()),
+            ("password", String::new()),
+            ("dynamicCode", String::new()),
+            ("uuid", String::new()),
+            ("answer1", String::new()),
+            ("answer2", String::new()),
+            ("otpCode", format!("{otp_code:06}")),
+            ("skipTmpReAuth", "true".to_string()),
+        ];
+        Ok(
+            self.client
+                .post(format!(
+                    "{}/authserver/reAuthCheck/reAuthSubmit.do",
+                    self.settings.auth_server
+                ))
+                .form(&submit_body)
+                .send()
+                .await?,
+        )
     }
 
     async fn validate_session(&self) -> Result<()> {
@@ -903,10 +901,7 @@ fn is_cas_login_url(url_str: &str) -> bool {
 }
 
 fn generate_totp(secret: &[u8]) -> u32 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = unix_time_secs();
     let counter = (now / 30).to_be_bytes();
     let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC can take key of any size");
     mac.update(&counter);
@@ -914,6 +909,28 @@ fn generate_totp(secret: &[u8]) -> u32 {
     let offset = (result[19] & 0xf) as usize;
     let code = u32::from_be_bytes(result[offset..offset + 4].try_into().unwrap()) & 0x7fff_ffff;
     code % 1_000_000
+}
+
+fn unix_time_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn totp_window_remaining_secs() -> u64 {
+    30 - (unix_time_secs() % 30)
+}
+
+async fn wait_for_stable_totp_window() {
+    let remaining = totp_window_remaining_secs();
+    if remaining <= 3 {
+        tokio::time::sleep(Duration::from_secs(remaining + 1)).await;
+    }
+}
+
+async fn wait_for_next_totp_window() {
+    tokio::time::sleep(Duration::from_secs(totp_window_remaining_secs() + 1)).await;
 }
 
 fn is_streaming_response(resp: &reqwest::Response) -> bool {
