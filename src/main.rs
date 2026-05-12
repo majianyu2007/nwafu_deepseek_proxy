@@ -551,9 +551,15 @@ impl AuthManager {
     }
 
     fn cookie_header(&self, url: &Url) -> Option<String> {
-        self.cookie_jar
-            .cookies(url)
-            .and_then(|v| v.to_str().ok().map(ToString::to_string))
+        // reqwest::cookie::Jar::cookies() does proper RFC 6265 matching
+        match self.cookie_jar.cookies(url) {
+            Some(v) => v.to_str().ok().map(ToString::to_string),
+            None => {
+                // Fallback: try iterating all cookies manually
+                let header = self.cookie_jar.cookies(&Url::parse("https://deepseek.nwafu.edu.cn").ok()?);
+                header.and_then(|v| v.to_str().ok().map(ToString::to_string))
+            }
+        }
     }
 }
 
@@ -944,15 +950,16 @@ async fn proxy_ws(state: AppState, mut client_ws: WebSocket, uri: Uri, headers: 
             .headers_mut()
             .insert("Authorization", HeaderValue::from_str(&value).unwrap());
     }
-    // Session cookies
-    if let Ok(url) = Url::parse(&target) {
+    // Session cookies — use https:// URL for lookup (cookies set via HTTPS)
+    let cookie_url = target.replacen("wss://", "https://", 1);
+    if let Ok(url) = Url::parse(&cookie_url) {
         if let Some(cookie) = state.auth.cookie_header(&url) {
             info!("event=ws_cookie len={}", cookie.len());
             if let Ok(value) = HeaderValue::from_str(&cookie) {
                 request.headers_mut().insert("Cookie", value);
             }
         } else {
-            warn!("event=ws_no_cookie url={}", target);
+            warn!("event=ws_no_cookie url={}", cookie_url);
         }
     }
     // Subprotocols
