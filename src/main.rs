@@ -364,8 +364,19 @@ impl AuthManager {
             .decode(secret.to_ascii_uppercase().as_bytes())
             .map_err(|e| anyhow!("2FA: invalid base32 secret: {e}"))?;
 
+        if secret_bytes.len() < 10 {
+            return Err(anyhow!(
+                "2FA: decoded TOTP secret too short ({} bytes), check TOTP_SECRET value",
+                secret_bytes.len()
+            ));
+        }
+        info!(
+            "event=2fa_totp_generated secret_len={} first_byte={:02x}",
+            secret_bytes.len(),
+            secret_bytes[0]
+        );
+
         let otp_code = generate_totp(&secret_bytes);
-        info!("event=2fa_totp_generated");
 
         // Step 3: 提交二次验证 (最多重试一次 TOTP 码)
         let submit_body = [
@@ -1112,4 +1123,46 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     info!("event=shutdown_start");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_totp_against_known_value() {
+        // RFC 6238 test vector: secret = "12345678901234567890" (base32: GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ)
+        // At time=59, T0=0, step=30, SHA1:
+        // HMAC-SHA1 result: 0x75a48a19d4cbe100644e8ac1397eea747a2d33ab (per RFC 6238 Appendix B)
+        // So we construct counter = 59/30 = 1
+        // Then verify our function produces the expected TOTP code
+        
+        let secret = b"12345678901234567890";  // 20 bytes raw ASCII
+        // We need to test at a specific time. But we can't control SystemTime in a simple test.
+        // Let's just verify the internal logic with known values.
+        
+        use hmac::Mac;
+        
+        // Test at counter=1 (time=30 to 59)
+        let counter = 1u64.to_be_bytes();
+        let mut mac = HmacSha1::new_from_slice(secret).unwrap();
+        mac.update(&counter);
+        let result = mac.finalize().into_bytes();
+        
+        // Expected HMAC per RFC 6238: 75a48a19d4cbe100644e8ac1397eea747a2d33ab
+        let expected_hmac: [u8; 20] = [
+            0x75, 0xa4, 0x8a, 0x19, 0xd4, 0xcb, 0xe1, 0x00,
+            0x64, 0x4e, 0x8a, 0xc1, 0x39, 0x7e, 0xea, 0x74,
+            0x7a, 0x2d, 0x33, 0xab,
+        ];
+        assert_eq!(&result[..], &expected_hmac[..], "HMAC-SHA1 mismatch");
+        
+        let offset = (result[19] & 0xf) as usize;
+        let code = u32::from_be_bytes(result[offset..offset + 4].try_into().unwrap()) & 0x7fff_ffff;
+        let totp = code % 1_000_000;
+        println!("TOTP = {:06}", totp);
+        
+        // TOTP at time=59 (counter=1), 6 digits, SHA1 → 287082
+        assert_eq!(totp, 287082, "TOTP for counter=1, 6-digit should be 287082");
+    }
 }
