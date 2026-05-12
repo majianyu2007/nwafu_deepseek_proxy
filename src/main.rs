@@ -902,12 +902,19 @@ async fn ws_handler(
 async fn proxy_ws(state: AppState, mut client_ws: WebSocket, uri: Uri, headers: HeaderMap) {
     if let Err(err) = state.auth.ensure_login().await {
         warn!("event=ws_auth_failed error={}", err);
+        let _ = client_ws
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 1013,
+                reason: "auth failed".into(),
+            })))
+            .await;
         return;
     }
     let target = match build_ws_url(&state.settings, &uri) {
         Ok(url) => url,
         Err(err) => {
             warn!("event=ws_url_error error={}", err);
+            let _ = client_ws.close().await;
             return;
         }
     };
@@ -915,10 +922,11 @@ async fn proxy_ws(state: AppState, mut client_ws: WebSocket, uri: Uri, headers: 
         Ok(req) => req,
         Err(err) => {
             warn!("event=ws_request_error error={}", err);
+            let _ = client_ws.close().await;
             return;
         }
     };
-    // 设置 Origin / Authorization / Cookie / User-Agent（对齐 Python 版）
+    // Origin / User-Agent
     request.headers_mut().insert(
         "Origin",
         HeaderValue::from_str(&state.settings.target_base).unwrap(),
@@ -929,33 +937,76 @@ async fn proxy_ws(state: AppState, mut client_ws: WebSocket, uri: Uri, headers: 
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         ),
     );
+    // API Key
     if !state.settings.openwebui_api_key.is_empty() {
         let value = format!("Bearer {}", state.settings.openwebui_api_key);
         request
             .headers_mut()
             .insert("Authorization", HeaderValue::from_str(&value).unwrap());
     }
+    // Session cookies
     if let Ok(url) = Url::parse(&target) {
         if let Some(cookie) = state.auth.cookie_header(&url) {
+            info!("event=ws_cookie len={}", cookie.len());
             if let Ok(value) = HeaderValue::from_str(&cookie) {
                 request.headers_mut().insert("Cookie", value);
             }
+        } else {
+            warn!("event=ws_no_cookie url={}", target);
         }
     }
+    // Subprotocols
     if let Some(protocol) = headers.get(header::SEC_WEBSOCKET_PROTOCOL) {
         request
             .headers_mut()
             .insert(header::SEC_WEBSOCKET_PROTOCOL, protocol.clone());
     }
+    // Forward non-hop-by-hop headers from client
+    for (name, value) in headers.iter() {
+        let name_lower = name.as_str().to_ascii_lowercase();
+        if matches!(
+            name_lower.as_str(),
+            "host" | "connection" | "upgrade" | "sec-websocket-key"
+                | "sec-websocket-version" | "sec-websocket-extensions"
+                | "sec-websocket-protocol" | "origin" | "user-agent"
+                | "authorization" | "cookie" | "content-length"
+        ) {
+            continue; // already handled or hop-by-hop
+        }
+        // Only forward if not already set
+        if !request.headers().contains_key(name) {
+            request.headers_mut().insert(name.clone(), value.clone());
+        }
+    }
+
+    info!(
+        "event=ws_connect path={} headers=[{}]",
+        uri.path(),
+        request
+            .headers()
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let upstream_ws = match connect_async_tls_with_config(request, None, false, None).await {
         Ok((ws, resp)) => {
-            debug!("event=ws_upstream_connected path={} status={}", uri.path(), resp.status());
+            info!(
+                "event=ws_connected path={} status={}",
+                uri.path(),
+                resp.status()
+            );
             ws
         }
         Err(err) => {
             warn!("event=ws_upstream_rejected path={} error={}", uri.path(), err);
-            let _ = client_ws.close().await;
+            let _ = client_ws
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: format!("upstream: {err}").into(),
+                })))
+                .await;
             return;
         }
     };
