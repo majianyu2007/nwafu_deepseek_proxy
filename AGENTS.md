@@ -40,6 +40,7 @@ python test_api.py Qwen3-235B-A22B  # Specific model
    - `OPENWEBUI_API_KEY` - From Open WebUI Settings / Account / API Keys
 
 3. Optional:
+   - `TOTP_SECRET` - TOTP authenticator secret (Base32) for auto-completing 2FA (required since 2026-05-12)
    - `MONITOR_ENABLED=true` - Enable model change monitoring
    - `MONITOR_POLL_INTERVAL` - Poll interval in seconds (default 600, min 300)
 
@@ -58,7 +59,7 @@ python test_api.py Qwen3-235B-A22B  # Specific model
 
 **Core flow:**
 1. Client -> `localhost:8000/*` -> FastAPI proxy
-2. Proxy authenticates via CAS (AES-CBC password encryption)
+2. Proxy authenticates via CAS (AES-CBC password encryption + TOTP 2FA)
 3. Transparently forwards ALL requests to `deepseek.nwafu.edu.cn` with valid session cookie + Bearer token
 4. Visiting `localhost:8000/` shows the full Open WebUI interface
 
@@ -88,6 +89,7 @@ Only a definitive CAS login page redirect (exact host `authserver.nwafu.edu.cn`)
 - fastapi, uvicorn, httpx - Core HTTP/server
 - pycryptodome - AES encryption
 - python-dotenv - Environment loading
+- pyotp - TOTP code generation for 2FA
 - HTML parsing for CAS login uses stdlib regex only
 
 ## Testing Notes

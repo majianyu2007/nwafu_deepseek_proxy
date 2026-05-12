@@ -9,7 +9,7 @@
 - 访问 `http://localhost:8000/` 可直接使用完整 Open WebUI。
 - OpenAI 兼容客户端使用 `http://localhost:8000/v1` 作为 API Base。
 - 客户端 API Key 可填写占位值，代理会注入真实 Open WebUI API Key。
-- 自动完成 CAS 登录、ST ticket 兑换、Cookie 保活和过期刷新。
+- 自动完成 CAS 登录（含二次验证 TOTP）、ST ticket 兑换、Cookie 保活和过期刷新。
 - 内置登录频率限制、指数退避、熔断和单飞锁，避免上游异常导致账号频繁登录。
 - 可选模型变更监控，支持 Telegram、Webhook、SSE 和 `/monitor` 面板。
 
@@ -51,6 +51,7 @@ cp .env.example .env
 | `PROXY_PORT` | 否 | 本地监听端口，默认 `8000` |
 | `TARGET_HOST` | 否 | 上游 Open WebUI 域名，默认 `deepseek.nwafu.edu.cn` |
 | `AUTH_SERVER` | 否 | CAS 服务地址，默认 `https://authserver.nwafu.edu.cn` |
+| `TOTP_SECRET` | 否 | TOTP 安全令牌密钥（Base32），用于自动完成二次验证 |
 
 ### 4. 启动
 
@@ -151,7 +152,8 @@ CAS 登录流程：
 2. 使用 AES-CBC + PKCS7 按前端逻辑加密密码。
 3. 提交登录表单。
 4. 跟随 AuthServer 到 Open WebUI CAS callback 的重定向链。
-5. 收集目标站会话 Cookie，用于后续代理请求。
+5. **（新增）检测二次验证跳转**：若重定向到 `reAuthLoginView.do?isMultifactor=true`，自动切换至安全令牌 (TOTP) 并提交验证码。
+6. 收集目标站会话 Cookie，用于后续代理请求。
 
 ## 账号保护
 
@@ -162,9 +164,32 @@ CAS 登录流程：
 | 状态机 | 区分 `OK`、`SUSPECT`、`EXPIRED`、`LOGIN_BACKOFF`、`CIRCUIT_OPEN` |
 | 单飞锁 | 并发请求最多触发一次真实 CAS 登录 |
 | 频率限制 | 每小时最多 6 次登录尝试，状态持久化到 `.data/login_state.json` |
+| 最小间隔 | 两次登录之间不少于 60s 冷却 |
+| force_relogin 限流 | 10s 内重复 force_relogin 请求被忽略 |
 | 指数退避 | 登录失败后逐步延长重试间隔 |
 | 熔断器 | 连续失败后暂停登录，保护账号 |
 | 失败分类 | 账号锁定、验证码、密码错误等高风险错误使用更长熔断 |
+| 会话验证 | 登录成功后立即 HEAD 目标站验证会话有效性 |
+
+## 二次验证 (TOTP)
+
+自 2026-05-12 起，NWAFU 统一身份认证系统启用二次验证。代理支持通过 TOTP 安全令牌自动完成二次验证。
+
+### 获取 TOTP 密钥
+
+1. 打开你绑定安全令牌时使用的认证器 APP（Google Authenticator / Microsoft Authenticator / Authy 等）。
+2. 找到 NWAFU 统一身份认证的账户条目，选择「查看详情」或「导出」。
+3. 复制密钥（32 位 Base32 编码的字符串，如 `JBSWY3DPEHPK3PXP`）。
+
+### 配置
+
+```env
+TOTP_SECRET=你的base32密钥
+```
+
+支持多种格式：纯 Base32、`otpauth://` URL、含空格字符串（自动清洗）。
+
+未配置 `TOTP_SECRET` 时，代理会在需要二次验证时正常报错并进入退避流程，不会影响单次人工登录。
 
 ## 模型变更监控
 

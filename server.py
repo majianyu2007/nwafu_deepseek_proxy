@@ -23,9 +23,10 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import urljoin, urlparse, quote, parse_qs
 
 import httpx
+import pyotp
 import websockets
 from websockets.asyncio.client import connect as websocket_connect
 from Crypto.Cipher import AES
@@ -106,6 +107,8 @@ DEGRADED_TIMEOUT = httpx.Timeout(8.0, connect=5.0)     # 上游异常时快速�
 DEGRADED_WINDOW = 120     # 2 分钟内
 DEGRADED_THRESHOLD = 2    # 出现 2 次失败即进入降级模式
 LOGIN_STICKY_WINDOW = 30  # 登录成功后短时间内仍被拒绝，视为会话建立异常
+LOGIN_MIN_INTERVAL = 60     # 两次登录之间的最小间隔（防止登录风暴）
+FORCE_RELOGIN_THROTTLE = 10  # force_relogin 限流窗口（秒）
 RESPONSE_REWRITE_MAX_BYTES = 5 * 1024 * 1024
 
 _RETRIABLE_NET_ERRORS = (
@@ -206,6 +209,7 @@ class Settings:
     webhook_urls: list[str]
     webhook_secret: str
     notify_proxy: str
+    totp_secret: str
 
     @property
     def target_base(self) -> str:
@@ -233,6 +237,7 @@ def load_settings() -> Settings:
     webhook_urls = [u.strip() for u in webhook_urls_raw.split(",") if u.strip()] if webhook_urls_raw else []
     webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
     notify_proxy = os.getenv("NOTIFY_PROXY", "").strip()
+    totp_secret = os.getenv("TOTP_SECRET", "").strip()
 
     if not username or not password:
         raise SystemExit("缺少必填环境变量：NWAFU_USERNAME / NWAFU_PASSWORD（请在 .env 中配置）")
@@ -255,6 +260,7 @@ def load_settings() -> Settings:
         webhook_urls=webhook_urls,
         webhook_secret=webhook_secret,
         notify_proxy=notify_proxy,
+        totp_secret=totp_secret,
     )
 
 
@@ -267,6 +273,7 @@ TARGET_HOST = settings.target_host
 OPENWEBUI_API_KEY = settings.openwebui_api_key
 AUTH_SERVER = settings.auth_server
 TARGET_BASE = settings.target_base
+TOTP_SECRET = settings.totp_secret
 
 # ============================================================
 # 金智 AuthServer AES 加密（对齐前端 encrypt.js）
@@ -323,6 +330,13 @@ class UpstreamUnavailableError(Exception):
     """上游暂不可达（用于向客户端返回 503）"""
 
 
+class TwoFactorError(Exception):
+    """二次验证失败（TOTP 码错误/过期等），使用较短退避"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
 # ============================================================
 # AuthServer 会话管理器
 # ============================================================
@@ -343,7 +357,6 @@ class AuthSessionManager:
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
-        self._lock = asyncio.Lock()          # 状态转移锁
         self._login_lock = asyncio.Lock()     # 单飞登录锁
         self._state: AuthState = AuthState.OK
         self._last_login_time: float = 0
@@ -361,6 +374,8 @@ class AuthSessionManager:
         self._recent_proxy_failures: list[float] = []  # 最近代理请求失败的时间戳
         self._last_login_ok_time: float = 0           # 最近一次成功登录的时间
         self._login_then_rejected: bool = False        # 登录成功后仍被拒绝
+        self._last_login_attempt_time: float = 0       # 最近一次登录尝试的时间
+        self._last_force_relogin_time: float = 0       # 最近一次 force_relogin 的时间
 
         # 从文件恢复持久化状态
         self._load_persisted_state()
@@ -503,8 +518,21 @@ class AuthSessionManager:
         )
         self._save_persisted_state()
 
+    def _check_or_raise_circuit(self) -> None:
+        """检查熔断状态，若熔断已过期则解除，否则抛出 CircuitOpenError"""
+        if self._state != AuthState.CIRCUIT_OPEN:
+            return
+        remaining = self._circuit_until - time.monotonic()
+        if remaining <= 0:
+            self._transition(AuthState.EXPIRED, "circuit_expired")
+            logger.info("event=circuit state=closed")
+            self._save_persisted_state()
+            return
+        msg = "Login temporarily disabled to protect the campus account. Please retry later."
+        raise CircuitOpenError(msg, retry_after=int(remaining))
+
     def _check_circuit(self) -> bool:
-        """检查熔断是否已过期，返回 True 表示熔断已解除"""
+        """检查熔断是否已过期，返回 True 表示熔断已解除（供外部只读使用）"""
         if self._state != AuthState.CIRCUIT_OPEN:
             return True
         if time.monotonic() >= self._circuit_until:
@@ -512,8 +540,6 @@ class AuthSessionManager:
             logger.info("event=circuit state=closed")
             self._save_persisted_state()
             return True
-        remaining = int(self._circuit_until - time.monotonic())
-        logger.info("event=circuit state=open remaining=%ds", remaining)
         return False
 
     # ---- 主入口：确保已登录 ----
@@ -532,18 +558,12 @@ class AuthSessionManager:
             return self._client
 
         # 熔断期间：若有旧 client 则继续使用（session 可能仍有效）
-        if self._state == AuthState.CIRCUIT_OPEN:
-            # 检查熔断是否过期
-            if time.monotonic() >= self._circuit_until:
-                self._transition(AuthState.EXPIRED, "circuit_expired")
-            elif self._client is not None:
+        try:
+            self._check_or_raise_circuit()
+        except CircuitOpenError:
+            if self._client is not None:
                 return self._client
-            else:
-                remaining = int(self._circuit_until - time.monotonic())
-                raise CircuitOpenError(
-                    "Login temporarily disabled to protect the campus account. Please retry later.",
-                    retry_after=remaining,
-                )
+            raise
 
         # SUSPECT 状态：不触发登录，继续使用旧 client
         if self._state == AuthState.SUSPECT and self._client is not None:
@@ -557,17 +577,12 @@ class AuthSessionManager:
                 return self._client
 
             # 再次检查熔断
-            if self._state == AuthState.CIRCUIT_OPEN:
-                if time.monotonic() >= self._circuit_until:
-                    self._transition(AuthState.EXPIRED, "circuit_expired")
-                elif self._client is not None:
+            try:
+                self._check_or_raise_circuit()
+            except CircuitOpenError:
+                if self._client is not None:
                     return self._client
-                else:
-                    remaining = int(self._circuit_until - time.monotonic())
-                    raise CircuitOpenError(
-                        "Login temporarily disabled to protect the campus account. Please retry later.",
-                        retry_after=remaining,
-                    )
+                raise
 
             # SUSPECT 复用旧 client（双重检查）
             if self._state == AuthState.SUSPECT and self._client is not None:
@@ -595,6 +610,22 @@ class AuthSessionManager:
                     return self._client
                 raise UpstreamUnavailableError("登录频率过高，请稍后重试")
 
+            # 登录最小间隔检查（防止登录风暴）
+            now3 = time.monotonic()
+            since_last_attempt = now3 - self._last_login_attempt_time
+            if self._last_login_attempt_time > 0 and since_last_attempt < LOGIN_MIN_INTERVAL:
+                remaining = int(LOGIN_MIN_INTERVAL - since_last_attempt)
+                logger.warning(
+                    "event=login_attempt outcome=denied reason=cooldown remaining=%ds "
+                    "last_attempt=%.1fs_ago",
+                    remaining, since_last_attempt,
+                )
+                if self._client is not None:
+                    return self._client
+                raise UpstreamUnavailableError(
+                    f"登录间隔过短（剩余 {remaining}s），请稍后重试"
+                )
+
             # 真正执行登录
             return await self._do_login_with_protections()
 
@@ -604,6 +635,7 @@ class AuthSessionManager:
             "event=login_attempt outcome=allowed state=%s consecutive_failures=%d",
             self._state.value, self._consecutive_failures,
         )
+        self._last_login_attempt_time = time.monotonic()
         self._record_login_attempt()
 
         try:
@@ -618,6 +650,19 @@ class AuthSessionManager:
             logger.info("event=login_result outcome=success")
             self._save_persisted_state()
             return self._client  # type: ignore[return-value]
+        except TwoFactorError as e:
+            self._consecutive_failures += 1
+            # 2FA 失败使用固定短退避（30s），不触发熔断
+            self._backoff_until = time.monotonic() + 30
+            self._transition(AuthState.LOGIN_BACKOFF, f"2fa_failed:{e}")
+            logger.error(
+                "event=login_result outcome=failure type=2fa error=%s failures=%d",
+                e, self._consecutive_failures,
+            )
+            if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                self._open_circuit(CIRCUIT_NORMAL_DURATION, f"consecutive_failures={self._consecutive_failures}")
+            self._save_persisted_state()
+            raise
         except CriticalLoginError as e:
             self._consecutive_failures += 1
             logger.error("event=login_result outcome=failure type=critical error=%s", e)
@@ -642,7 +687,22 @@ class AuthSessionManager:
         仅在明确检测到 CAS session 失效时调用。
         调用者必须已经确认响应是真实的 CAS 登录页重定向。
         此方法仍需通过 ensure_login() 的所有保护层级。
+
+        限流：10 秒内重复调用 force_relogin 会被忽略。
         """
+        now = time.monotonic()
+        since_last = now - self._last_force_relogin_time
+        if self._last_force_relogin_time > 0 and since_last < FORCE_RELOGIN_THROTTLE:
+            logger.warning(
+                "event=force_relogin outcome=throttled "
+                "since_last=%.1fs throttle=%ds — 忽略重复请求",
+                since_last, FORCE_RELOGIN_THROTTLE,
+            )
+            if self._client is not None:
+                return self._client
+            raise UpstreamUnavailableError("登录请求过于频繁，请稍后重试")
+
+        self._last_force_relogin_time = now
         logger.warning("event=force_relogin requested — 检测到明确的 CAS 会话失效")
         self._transition(AuthState.EXPIRED, "force_relogin:definitive_cas_redirect")
         try:
@@ -767,8 +827,7 @@ class AuthSessionManager:
             if resp.status_code in (301, 302, 307, 308):
                 location = resp.headers.get("location", "")
                 logger.info("检测到有效 TGC，跟随重定向完成会话建立")
-                await self._follow_cas_redirect(location)
-                logger.info("登录成功（复用 TGC）")
+                await self._handle_login_redirect(location)
                 return
 
             execution, salt = _parse_login_form(resp.text)
@@ -796,8 +855,7 @@ class AuthSessionManager:
             if resp.status_code in (301, 302, 307, 308):
                 location = resp.headers.get("location", "")
                 logger.info("登录表单提交成功，跟随重定向链：%s...", location[:80])
-                await self._follow_cas_redirect(location)
-                logger.info("认证完成，会话 Cookie 已就绪")
+                await self._handle_login_redirect(location)
             else:
                 msg, failure_type, circuit_dur = self._classify_login_failure(resp)
                 if failure_type in ("account_locked", "captcha", "password_error", "rate_limited"):
@@ -810,21 +868,184 @@ class AuthSessionManager:
             logger.error("event=login_error error=%s", e)
             raise
 
-    async def _follow_cas_redirect(self, location: str):
+    async def _follow_cas_redirect(self, location: str) -> tuple[str, Optional[httpx.Response]]:
+        """跟随 CAS 重定向链。返回 (final_url, last_response)。"""
         max_redirects = MAX_LOGIN_REDIRECTS
         current_url = location
+        last_resp = None
         for i in range(max_redirects):
             if not current_url:
                 break
             logger.info("跟随重定向[%d/%d]：%s...", i + 1, max_redirects, current_url[:80])
-            resp = await self._retry_request("GET", current_url, follow_redirects=False)
-            if resp.status_code in (301, 302, 307, 308):
-                current_url = resp.headers.get("location", "")
+            last_resp = await self._retry_request("GET", current_url, follow_redirects=False)
+            if last_resp.status_code in (301, 302, 307, 308):
+                current_url = last_resp.headers.get("location", "")
                 if current_url and not current_url.startswith("http"):
-                    current_url = urljoin(str(resp.url), current_url)
+                    current_url = urljoin(str(last_resp.url), current_url)
             else:
-                logger.info("重定向链结束：url=%s status=%d", resp.url, resp.status_code)
+                logger.info("重定向链结束：url=%s status=%d", last_resp.url, last_resp.status_code)
                 break
+        return (str(last_resp.url) if last_resp else location, last_resp)
+
+    async def _handle_login_redirect(self, location: str):
+        """统一处理登录后的重定向链：跟随重定向 → 检测 2FA → 验证会话"""
+        final_url, _last_resp = await self._follow_cas_redirect(location)
+
+        # 检测二次验证跳转（TGC 复用和新登录都会触发）
+        if self._RE_AUTH_VIEW.search(final_url):
+            logger.info("event=2fa_detected url=%s", final_url[:80])
+            parsed = urlparse(final_url)
+            params = parse_qs(parsed.query)
+            service_url = (
+                params.get("service", [None])[0]
+                or quote(f"{TARGET_BASE}/.auth/login/cas/callback?return_to={TARGET_BASE}/")
+            )
+            await self._complete_2fa(service_url)
+
+        # 登录后验证：确保会话确实可用
+        await self._validate_session()
+
+        logger.info("认证完成，会话 Cookie 已就绪")
+
+    async def _validate_session(self):
+        """登录后快速验证会话是否有效。失败时抛出异常避免虚假 OK 状态。"""
+        try:
+            headers = {"Host": TARGET_HOST}
+            if OPENWEBUI_API_KEY:
+                headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+
+            resp = await self._client.head(
+                f"{TARGET_BASE}/api/config",
+                headers=headers,
+                follow_redirects=False,
+            )
+
+            if resp.status_code in (301, 302, 307):
+                location = resp.headers.get("location", "")
+                if _is_cas_login_url(location):
+                    raise RuntimeError(
+                        f"会话验证失败：登录后仍被重定向到 CAS 登录页 location={location[:80]}"
+                    )
+            logger.info("event=session_validated status=%d", resp.status_code)
+        except _RETRIABLE_NET_ERRORS as e:
+            logger.warning("event=session_validation_skipped reason=network_error error=%s", e)
+        except httpx.HTTPStatusError as e:
+            logger.warning("event=session_validation_http_error status=%d", e.response.status_code)
+        except RuntimeError:
+            raise
+
+    # ---- 二次验证 (2FA / TOTP) ----
+
+    _RE_AUTH_VIEW = re.compile(r"/authserver/reAuthCheck/reAuthLoginView\.do", re.I)
+
+    async def _complete_2fa(self, service_url: str):
+        """通过 TOTP 安全令牌完成二次验证。完成后跟随重定向链回到目标服务。"""
+        logger.info("event=2fa_start service=%s", service_url[:60])
+
+        # Step 1: 切换到安全令牌 (reAuthType=10)
+        change_body = {
+            "isMultifactor": "true",
+            "reAuthType": "10",
+            "service": service_url,
+        }
+        change_resp = await self._retry_request(
+            "POST",
+            f"{AUTH_SERVER}/authserver/reAuthCheck/changeReAuthType.do",
+            data=change_body,
+            headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"},
+        )
+        if change_resp.status_code != 200:
+            raise RuntimeError(f"切换二次验证方式失败：HTTP {change_resp.status_code}")
+        try:
+            change_data = change_resp.json()
+        except Exception:
+            change_data = {}
+        if change_data.get("code") != "1":
+            raise RuntimeError(f"切换二次验证方式被拒绝：{change_data.get('message', change_resp.text[:200])}")
+        logger.info("event=2fa_switch reAuthType=10 name=%s",
+                    change_data.get("data", {}).get("reAuthTypeName", "?"))
+
+        # Step 2: 生成 TOTP 码
+        if not TOTP_SECRET:
+            raise RuntimeError(
+                "检测到二次验证要求，但未配置 TOTP_SECRET。"
+                "请从认证器 APP 中获取 TOTP 密钥并填入 .env 文件"
+            )
+        # 兼容多种 secret 格式：纯 base32、otpauth:// URL、含空格的
+        secret = TOTP_SECRET.strip()
+        if secret.startswith("otpauth://"):
+            # 从 otpauth URL 中提取 secret 参数
+            _q = urlparse(secret).query
+            _params = parse_qs(_q)
+            secret = _params.get("secret", [secret])[0]
+        # 移除可能混入的空格和换行
+        secret = re.sub(r"\s+", "", secret)
+        totp = pyotp.TOTP(secret)
+        otp_code = totp.now()
+        logger.info("event=2fa_totp_generated code=%s****", otp_code[:2])
+
+        # Step 3: 提交二次验证
+        submit_body = {
+            "service": service_url,
+            "reAuthType": "10",
+            "isMultifactor": "true",
+            "password": "",
+            "dynamicCode": "",
+            "uuid": "",
+            "answer1": "",
+            "answer2": "",
+            "otpCode": otp_code,
+            "skipTmpReAuth": "true",
+        }
+        submit_resp = await self._retry_request(
+            "POST",
+            f"{AUTH_SERVER}/authserver/reAuthCheck/reAuthSubmit.do",
+            data=submit_body,
+            headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"},
+        )
+        if submit_resp.status_code != 200:
+            raise RuntimeError(f"二次验证提交失败：HTTP {submit_resp.status_code}")
+
+        submit_data = {}
+        try:
+            submit_data = submit_resp.json()
+        except Exception:
+            pass
+
+        if submit_data.get("code") != "reAuth_success":
+            msg = submit_data.get("msg", submit_resp.text[:200])
+            # 如果 TOTP 码被拒，等 2s 后用新码重试一次（处理时钟漂移/码过期）
+            if self._consecutive_failures == 0 and ("code" in msg.lower() or "fail" in msg.lower() or "error" in msg.lower()):
+                logger.warning("event=2fa_retry reason=TOTP码被拒，等2s后用新码重试 msg=%s", msg)
+                await asyncio.sleep(2)
+                new_code = pyotp.TOTP(secret).now()
+                submit_body["otpCode"] = new_code
+                logger.info("event=2fa_retry new_code=%s****", new_code[:2])
+                retry_resp = await self._retry_request(
+                    "POST",
+                    f"{AUTH_SERVER}/authserver/reAuthCheck/reAuthSubmit.do",
+                    data=submit_body,
+                    headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"},
+                )
+                try:
+                    retry_data = retry_resp.json()
+                except Exception:
+                    retry_data = {}
+                if retry_data.get("code") == "reAuth_success":
+                    logger.info("event=2fa_success_after_retry")
+                    await self._follow_cas_redirect(service_url)
+                    logger.info("event=2fa_complete")
+                    return
+                msg = retry_data.get("msg", retry_resp.text[:200])
+            raise TwoFactorError(f"二次验证失败：{msg}")
+
+        logger.info("event=2fa_success")
+
+        # Step 4: 二次验证成功后跟随重定向
+        # reAuthSubmit 成功后浏览器会通过 JS 跳转到 service URL，
+        # 我们需要模拟：直接请求 service URL
+        await self._follow_cas_redirect(service_url)
+        logger.info("event=2fa_complete")
 
     # ---- 保活 ----
 
@@ -1559,15 +1780,102 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
     )
 
     @_app.get("/health")
-    async def health():
-        return {
-            "status": "ok",
+    async def health(response: Response):
+        """健康检查：报告认证状态、上游可达性和会话有效性。
+
+        不会触发登录，仅使用已有 client 做轻量验证。
+        """
+        now = time.time()
+        now_mono = time.monotonic()
+
+        state = manager.state
+        state_value = state.value
+
+        # 基础信息
+        result = {
             "service": "NWAFU DeepSeek Proxy",
             "target": TARGET_BASE,
-            "auth_state": manager.state.value,
             "api_base": f"http://localhost:{PROXY_PORT}/v1",
-            "note": "所有请求透明转发到源站，与源站保持一致",
+            "auth_state": state_value,
         }
+
+        # 熔断信息
+        if state == AuthState.CIRCUIT_OPEN:
+            remaining = int(max(0, manager._circuit_until - now_mono))
+            result["status"] = "degraded"
+            result["circuit_remaining_seconds"] = remaining
+            result["note"] = "登录已熔断，请稍后重试"
+            response.headers["Retry-After"] = str(remaining)
+            response.status_code = 503
+            return result
+
+        # 退避信息
+        if state == AuthState.LOGIN_BACKOFF:
+            remaining = int(max(0, manager._backoff_until - now_mono))
+            result["status"] = "degraded"
+            result["backoff_remaining_seconds"] = remaining
+            result["note"] = "登录退避中"
+            response.headers["Retry-After"] = str(remaining)
+            return result
+
+        # 统计信息
+        last_ok_ago = int(now_mono - manager._last_login_ok_time) if manager._last_login_ok_time > 0 else -1
+        last_attempt_ago = int(now_mono - manager._last_login_attempt_time) if manager._last_login_attempt_time > 0 else -1
+        result["last_login_ok_seconds_ago"] = last_ok_ago
+        result["consecutive_failures"] = manager._consecutive_failures
+
+        recent_failures = [t for t in manager._login_attempt_times if t > now - LOGIN_WINDOW_SECONDS]
+        result["login_attempts_last_hour"] = len(recent_failures)
+
+        # 会话验证：若状态 OK 且有 client，做一次实际探测
+        client = manager._client
+        if state == AuthState.OK and client is not None:
+            t0 = time.monotonic()
+            try:
+                headers = {"Host": TARGET_HOST}
+                if OPENWEBUI_API_KEY:
+                    headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+
+                probe = await client.head(
+                    f"{TARGET_BASE}/api/config",
+                    headers=headers,
+                    follow_redirects=False,
+                )
+                latency_ms = int((time.monotonic() - t0) * 1000)
+
+                if probe.status_code in (301, 302, 307):
+                    location = probe.headers.get("location", "")
+                    if _is_cas_login_url(location):
+                        result["status"] = "unhealthy"
+                        result["note"] = "会话已过期，需要重新登录"
+                        result["latency_ms"] = latency_ms
+                        response.status_code = 503
+                        return result
+
+                result["status"] = "healthy"
+                result["upstream_status"] = probe.status_code
+                result["latency_ms"] = latency_ms
+                result["note"] = "代理运行正常，会话有效"
+                return result
+            except Exception as e:
+                result["status"] = "degraded"
+                result["note"] = f"上游探测失败: {type(e).__name__}"
+                result["latency_ms"] = int((time.monotonic() - t0) * 1000)
+                return result
+
+        if state == AuthState.SUSPECT:
+            result["status"] = "degraded"
+            result["note"] = "认证状态异常，正在等待恢复"
+            return result
+
+        if state == AuthState.EXPIRED:
+            result["status"] = "degraded"
+            result["note"] = "会话已过期，需要重新登录"
+            return result
+
+        result["status"] = "ok"
+        result["note"] = "代理已启动，会话尚未建立"
+        return result
 
     return _app
 

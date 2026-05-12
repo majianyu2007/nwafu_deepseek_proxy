@@ -49,11 +49,19 @@ Key principle: only definitive CAS login page redirects (`authserver.nwafu.edu.c
 2. **Circuit breaker** — 3 consecutive failures → `CIRCUIT_OPEN` for 15min–6h, returns 503 with `Retry-After` header
 3. **Exponential backoff** — `5s → 20s → 80s → 5min → 15min` (with jitter)
 4. **Rate limiting** — max 6 login attempts per hour, persisted to `.data/login_state.json`
-5. **Single-flight lock** — `asyncio.Lock` + double-check pattern in `ensure_login()`, at most 1 real CAS login across concurrent requests
+5. **Minimum login interval** — 60s cooldown between successive login attempts (`LOGIN_MIN_INTERVAL`)
+6. **Single-flight lock** — `asyncio.Lock` + double-check pattern in `ensure_login()`, at most 1 real CAS login across concurrent requests
+7. **`force_relogin` throttling** — 10s dedup window, repeated calls ignored
+8. **Post-login session validation** — `_validate_session()` HEAD-checks target after login, raises on CAS redirect
+9. **TGC reuse 2FA handling** — `_handle_login_redirect()` shared by both TGC-reuse and form-submit paths, both detect and complete 2FA
 
 ### CAS detection (strict)
 
 `_is_cas_login_url()` requires **exact host match** (`authserver.nwafu.edu.cn`) and path prefix match (`/authserver/login`). No substring matching. For 401/403 HTML responses, body is sampled (first 4KB) to check for CAS form fields (`execution` + `pwdEncryptSalt`). Streaming endpoints are never body-sampled.
+
+### Health check (`/health`)
+
+Returns real-time diagnostics. In OK state, does a live HEAD probe to upstream `/api/config` to verify session validity (does not trigger login). Reports latency, auth state, login statistics, circuit/backoff remaining time. Returns 503 with `Retry-After` header if degraded.
 
 ### Full reverse proxy
 
@@ -69,19 +77,25 @@ Optional. Enable with `MONITOR_ENABLED=true`. Polls `/v1/models` at configurable
 
 ## Configuration
 
-Copy `.env.example` to `.env`. Required: `NWAFU_USERNAME`, `NWAFU_PASSWORD`, `OPENWEBUI_API_KEY`. Optional: `PROXY_PORT`, `TARGET_HOST`, `AUTH_SERVER`, `CORS_ORIGINS`, `MONITOR_ENABLED`, `MONITOR_POLL_INTERVAL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `WEBHOOK_URLS`, `WEBHOOK_SECRET`, `NOTIFY_PROXY`.
+Copy `.env.example` to `.env`. Required: `NWAFU_USERNAME`, `NWAFU_PASSWORD`, `OPENWEBUI_API_KEY`. Optional: `PROXY_PORT`, `TARGET_HOST`, `AUTH_SERVER`, `CORS_ORIGINS`, `MONITOR_ENABLED`, `MONITOR_POLL_INTERVAL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `WEBHOOK_URLS`, `WEBHOOK_SECRET`, `NOTIFY_PROXY`, `TOTP_SECRET`.
 
 Clients can use any placeholder API key (e.g., `sk-any`) — the proxy injects the real key.
 
+### TOTP 二次验证
+
+自 2026-05-12 起 NWAFU 统一身份认证启用二次验证。代理支持通过 TOTP 安全令牌自动完成二次验证，需配置 `TOTP_SECRET`（从认证器 APP 获取 Base32 密钥）。
+
+登录流程：POST login form → 302 到 `reAuthLoginView.do?isMultifactor=true` → `_complete_2fa()` 自动切换至安全令牌 (reAuthType=10)，生成 TOTP 码并提交 → 跟随重定向回到目标服务。
+
 ## Dependencies
 
-`fastapi`, `uvicorn`, `httpx`, `pycryptodome`, `python-dotenv` — see `requirements.txt`. HTML parsing for CAS pages uses stdlib regex only.
+`fastapi`, `uvicorn`, `httpx`, `pycryptodome`, `python-dotenv`, `pyotp` — see `requirements.txt`. HTML parsing for CAS pages uses stdlib regex only.
 
 ## Key files
 
 | File | Purpose |
 |------|---------|
-| `server.py` | Main application: auth, proxy, routes |
+| `server.py` | Main application: auth, proxy, routes, TOTP 2FA |
 | `utils/model_monitor.py` | Optional model change monitor |
 | `static/monitor.html` | Monitor dashboard (only if MONITOR_ENABLED) |
 | `list_models.py` | CLI utility to list available models |
