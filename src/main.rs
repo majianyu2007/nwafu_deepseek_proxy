@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aes::Aes128;
@@ -20,7 +20,9 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+use data_encoding::BASE32_NOPAD;
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use rand::{seq::SliceRandom, thread_rng};
 use regex::Regex;
 use reqwest::{
@@ -29,15 +31,21 @@ use reqwest::{
     Client,
 };
 use serde::Serialize;
+use sha1::Sha1;
 use tokio::{net::TcpListener, sync::Mutex, task::JoinSet};
 use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::client::IntoClientRequest};
 use tracing::{debug, error, info, warn};
 use url::{form_urlencoded::byte_serialize, Url};
 
+type HmacSha1 = Hmac<Sha1>;
+
 type Aes128CbcEnc = cbc::Encryptor<Aes128>;
 
 const COOKIE_TTL: Duration = Duration::from_secs(25 * 60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const LOGIN_STICKY_WINDOW: Duration = Duration::from_secs(30);
+const LOGIN_MIN_INTERVAL: Duration = Duration::from_secs(60);
+const FORCE_RELOGIN_THROTTLE: Duration = Duration::from_secs(10);
 const MAX_LOGIN_ATTEMPTS_PER_HOUR: usize = 6;
 const LOGIN_WINDOW: Duration = Duration::from_secs(3600);
 const MAX_LOGIN_REDIRECTS: usize = 10;
@@ -54,6 +62,7 @@ struct Settings {
     target_base: String,
     openwebui_api_key: String,
     auth_server: String,
+    totp_secret: String,
 }
 
 impl Settings {
@@ -69,6 +78,7 @@ impl Settings {
             .context("invalid PROXY_PORT")?;
         let target_host = env("TARGET_HOST", "deepseek.nwafu.edu.cn");
         let auth_server = env("AUTH_SERVER", "https://authserver.nwafu.edu.cn");
+        let totp_secret = env("TOTP_SECRET", "");
         Ok(Self {
             username,
             password,
@@ -77,6 +87,7 @@ impl Settings {
             target_host,
             openwebui_api_key: env("OPENWEBUI_API_KEY", ""),
             auth_server: auth_server.trim_end_matches('/').to_string(),
+            totp_secret,
         })
     }
 }
@@ -105,6 +116,8 @@ struct AuthManager {
 struct AuthState {
     last_login: Option<Instant>,
     last_login_ok: Option<Instant>,
+    last_login_attempt_time: Option<Instant>,
+    last_force_relogin_time: Option<Instant>,
     login_attempts: VecDeque<Instant>,
     consecutive_failures: usize,
     backoff_until: Option<Instant>,
@@ -158,7 +171,19 @@ impl AuthManager {
         if state.login_attempts.len() >= MAX_LOGIN_ATTEMPTS_PER_HOUR {
             return Err(anyhow!("login rate limit exceeded"));
         }
+        // 登录最小间隔
+        if let Some(last) = state.last_login_attempt_time {
+            let since = last.elapsed();
+            if since < LOGIN_MIN_INTERVAL {
+                let remaining = LOGIN_MIN_INTERVAL - since;
+                return Err(anyhow!(
+                    "login cooldown active, {:.0}s remaining",
+                    remaining.as_secs_f64()
+                ));
+            }
+        }
         state.login_attempts.push_back(Instant::now());
+        state.last_login_attempt_time = Some(Instant::now());
         drop(state);
 
         match self.do_login().await {
@@ -176,7 +201,12 @@ impl AuthManager {
             Err(err) => {
                 let mut state = self.state.lock().await;
                 state.consecutive_failures += 1;
-                let delay = backoff_delay(state.consecutive_failures);
+                let msg = err.to_string();
+                let delay = if msg.contains("2FA") || msg.contains("TOTP") {
+                    Duration::from_secs(30) // 2FA failures use short backoff
+                } else {
+                    backoff_delay(state.consecutive_failures)
+                };
                 state.backoff_until = Some(Instant::now() + delay);
                 if state.consecutive_failures >= 3 {
                     state.circuit_until = Some(Instant::now() + Duration::from_secs(15 * 60));
@@ -201,7 +231,8 @@ impl AuthManager {
         let resp = self.client.get(&login_url).send().await?;
         if is_redirect(resp.status()) {
             let location = location(&resp)?;
-            self.follow_redirects(location).await?;
+            info!("event=tgc_reuse following redirect chain");
+            self.handle_login_redirect(&location).await?;
             return Ok(());
         }
         let html = resp.text().await?;
@@ -227,11 +258,42 @@ impl AuthManager {
             ));
         }
         let location = location(&resp)?;
-        self.follow_redirects(location).await
+        self.handle_login_redirect(&location).await
     }
 
-    async fn follow_redirects(&self, initial_location: String) -> Result<()> {
-        let mut current = Url::parse(&initial_location)?;
+    async fn handle_login_redirect(&self, initial_location: &str) -> Result<()> {
+        let (final_url, _) = self.follow_redirects(initial_location).await?;
+
+        // 检测二次验证
+        if final_url.contains("/reAuthLoginView.do") {
+            let service_url = Url::parse(&final_url)
+                .ok()
+                .and_then(|u| {
+                    u.query_pairs()
+                        .find(|(k, _)| k == "service")
+                        .map(|(_, v)| v.to_string())
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}/.auth/login/cas/callback?return_to={}/",
+                        self.settings.target_base, self.settings.target_base
+                    )
+                });
+            info!("event=2fa_detected url={}", final_url);
+            self.complete_2fa(&service_url).await?;
+        }
+
+        self.validate_session().await?;
+        info!("event=login_complete");
+        Ok(())
+    }
+
+    async fn follow_redirects(
+        &self,
+        initial_location: &str,
+    ) -> Result<(String, Option<reqwest::Response>)> {
+        let mut current = Url::parse(initial_location)?;
+        let mut last_resp = None;
         for idx in 0..MAX_LOGIN_REDIRECTS {
             info!("event=login_redirect step={} url={}", idx + 1, current);
             let resp = self.client.get(current.clone()).send().await?;
@@ -241,12 +303,227 @@ impl AuthManager {
                     resp.status(),
                     resp.url()
                 );
-                return Ok(());
+                last_resp = Some(resp);
+                break;
             }
             let next = location(&resp)?;
             current = resp.url().join(&next)?;
         }
-        Err(anyhow!("login redirect limit exceeded"))
+        Ok((current.to_string(), last_resp))
+    }
+
+    async fn complete_2fa(&self, service_url: &str) -> Result<()> {
+        info!("event=2fa_start service={}", service_url);
+
+        // Step 1: 切换到安全令牌 (reAuthType=10)
+        let change_body = [
+            ("isMultifactor", "true"),
+            ("reAuthType", "10"),
+            ("service", service_url),
+        ];
+        let change_resp = self
+            .client
+            .post(format!(
+                "{}/authserver/reAuthCheck/changeReAuthType.do",
+                self.settings.auth_server
+            ))
+            .form(&change_body)
+            .send()
+            .await?;
+        if change_resp.status() != reqwest::StatusCode::OK {
+            return Err(anyhow!("2FA: switch to TOTP failed, HTTP {}", change_resp.status()));
+        }
+        let change_data: serde_json::Value = change_resp.json().await.unwrap_or_default();
+        if change_data.get("code").and_then(|v| v.as_str()) != Some("1") {
+            return Err(anyhow!(
+                "2FA: switch to TOTP rejected: {}",
+                change_data.get("message").and_then(|v| v.as_str()).unwrap_or("?")
+            ));
+        }
+        info!("event=2fa_switch reAuthType=10");
+
+        // Step 2: 生成 TOTP 码
+        let totp_secret = self.settings.totp_secret.trim();
+        if totp_secret.is_empty() {
+            return Err(anyhow!("2FA: TOTP_SECRET not configured"));
+        }
+        let secret = if totp_secret.starts_with("otpauth://") {
+            // 从 otpauth URL 提取 secret 参数
+            Url::parse(totp_secret)
+                .ok()
+                .and_then(|u| {
+                    u.query_pairs()
+                        .find(|(k, _)| k == "secret")
+                        .map(|(_, v)| v.to_string())
+                })
+                .unwrap_or_else(|| totp_secret.to_string())
+        } else {
+            totp_secret.replace(char::is_whitespace, "")
+        };
+        let secret_bytes = BASE32_NOPAD
+            .decode(secret.to_ascii_uppercase().as_bytes())
+            .map_err(|e| anyhow!("2FA: invalid base32 secret: {e}"))?;
+
+        let otp_code = generate_totp(&secret_bytes);
+        info!("event=2fa_totp_generated");
+
+        // Step 3: 提交二次验证 (最多重试一次 TOTP 码)
+        let submit_body = [
+            ("service", service_url.to_string()),
+            ("reAuthType", "10".to_string()),
+            ("isMultifactor", "true".to_string()),
+            ("password", String::new()),
+            ("dynamicCode", String::new()),
+            ("uuid", String::new()),
+            ("answer1", String::new()),
+            ("answer2", String::new()),
+            ("otpCode", otp_code.to_string()),
+            ("skipTmpReAuth", "true".to_string()),
+        ];
+        let submit = || async {
+            self.client
+                .post(format!(
+                    "{}/authserver/reAuthCheck/reAuthSubmit.do",
+                    self.settings.auth_server
+                ))
+                .form(&submit_body)
+                .send()
+                .await
+        };
+
+        let mut resp = submit().await?;
+        if resp.status() != reqwest::StatusCode::OK {
+            return Err(anyhow!("2FA: submit failed, HTTP {}", resp.status()));
+        }
+        let data: serde_json::Value = resp.json().await.unwrap_or_default();
+        let code = data.get("code").and_then(|v| v.as_str()).unwrap_or("");
+
+        if code != "reAuth_success" {
+            // 重试一次
+            warn!("event=2fa_retry reason=first code rejected, retrying in 2s");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let new_code = generate_totp(&secret_bytes);
+            let mut retry_body = submit_body;
+            retry_body[8].1 = new_code.to_string();
+            resp = self
+                .client
+                .post(format!(
+                    "{}/authserver/reAuthCheck/reAuthSubmit.do",
+                    self.settings.auth_server
+                ))
+                .form(&retry_body)
+                .send()
+                .await?;
+            if resp.status() != reqwest::StatusCode::OK {
+                return Err(anyhow!("2FA: retry submit failed, HTTP {}", resp.status()));
+            }
+            let retry_data: serde_json::Value = resp.json().await.unwrap_or_default();
+            if retry_data.get("code").and_then(|v| v.as_str()) != Some("reAuth_success") {
+                let msg = retry_data
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                return Err(anyhow!("2FA TOTP failed after retry: {msg}"));
+            }
+        }
+
+        info!("event=2fa_success");
+
+        // Step 4: 跟随重定向回到目标服务
+        self.follow_redirects(service_url).await?;
+        info!("event=2fa_complete");
+        Ok(())
+    }
+
+    async fn validate_session(&self) -> Result<()> {
+        let resp = self
+            .client
+            .head(format!("{}/api/config", self.settings.target_base))
+            .header(reqwest::header::HOST, &self.settings.target_host)
+            .bearer_auth(&self.settings.openwebui_api_key)
+            .send()
+            .await?;
+        if is_redirect(resp.status()) {
+            if let Ok(loc) = location(&resp) {
+                if is_cas_login_url(&loc) {
+                    return Err(anyhow!(
+                        "session validation failed: redirected to CAS login"
+                    ));
+                }
+            }
+        }
+        info!("event=session_validated status={}", resp.status());
+        Ok(())
+    }
+
+    async fn force_relogin(&self) -> Result<()> {
+        let now = Instant::now();
+        {
+            let mut state = self.state.lock().await;
+            if let Some(last) = state.last_force_relogin_time {
+                if last.elapsed() < FORCE_RELOGIN_THROTTLE {
+                    warn!("event=force_relogin outcome=throttled");
+                    return if state.last_login.is_some() {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("login throttled"))
+                    };
+                }
+            }
+            state.last_force_relogin_time = Some(now);
+        }
+        warn!("event=force_relogin requested");
+        self.ensure_login().await
+    }
+
+    async fn check_and_refresh(&self) {
+        let state = self.state.lock().await;
+        if state.circuit_until.is_some() {
+            return;
+        }
+        drop(state);
+
+        let resp = match self
+            .client
+            .head(format!("{}/api/config", self.settings.target_base))
+            .header(reqwest::header::HOST, &self.settings.target_host)
+            .bearer_auth(&self.settings.openwebui_api_key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("event=keepalive error=network {}", e);
+                return;
+            }
+        };
+
+        if is_redirect(resp.status()) {
+            if let Ok(loc) = location(&resp) {
+                if is_cas_login_url(&loc) {
+                    warn!("event=keepalive result=cas_redirect");
+                    if let Err(e) = self.ensure_login().await {
+                        warn!("event=keepalive relogin_failed: {e}");
+                    }
+                    return;
+                }
+            }
+        }
+
+        if resp.status().as_u16() >= 400 {
+            warn!("event=keepalive result=upstream_error status={}", resp.status());
+        } else {
+            debug!("event=keepalive ok");
+        }
+    }
+
+    async fn start_keepalive(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+                self.check_and_refresh().await;
+            }
+        });
     }
 
     async fn recent_login_rejected(&self) -> bool {
@@ -302,16 +579,101 @@ fn location(resp: &reqwest::Response) -> Result<String> {
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     #[derive(Serialize)]
     struct Health {
-        status: &'static str,
+        status: String,
         service: &'static str,
         target: String,
         api_base: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auth_state: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latency_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        upstream_status: Option<u16>,
     }
+
+    let state_guard = state.auth.state.lock().await;
+    let circuit = state_guard.circuit_until.is_some_and(|t| Instant::now() < t);
+    let backoff = state_guard.backoff_until.is_some_and(|t| Instant::now() < t);
+    let logged_in = state_guard.last_login.is_some_and(|t| t.elapsed() < COOKIE_TTL);
+    let consecutive = state_guard.consecutive_failures;
+    let last_ok_ago = state_guard
+        .last_login_ok
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    drop(state_guard);
+
+    let t0 = Instant::now();
+    let probe = state
+        .auth
+        .client
+        .head(format!("{}/api/config", state.settings.target_base))
+        .header(
+            reqwest::header::HOST,
+            &state.settings.target_host,
+        )
+        .bearer_auth(&state.settings.openwebui_api_key)
+        .send()
+        .await;
+
+    let latency = t0.elapsed().as_millis() as u64;
+
+    let (status, note, upstream_status) = match probe {
+        Ok(resp) if resp.status().is_success() => {
+            ("healthy".into(), Some("proxy normal, session valid".into()), Some(resp.status().as_u16()))
+        }
+        Ok(resp) if is_redirect(resp.status()) => {
+            let is_cas = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|loc| is_cas_login_url(loc))
+                .unwrap_or(false);
+            if is_cas {
+                ("unhealthy".into(), Some("session expired, re-login needed".into()), Some(resp.status().as_u16()))
+            } else {
+                ("degraded".into(), Some("upstream redirect detected".into()), Some(resp.status().as_u16()))
+            }
+        }
+        Ok(resp) => {
+            ("degraded".into(), Some(format!("upstream status {}", resp.status())), Some(resp.status().as_u16()))
+        }
+        Err(e) => {
+            ("degraded".into(), Some(format!("probe failed: {e}")), None)
+        }
+    };
+
     Json(Health {
-        status: "ok",
+        status: if circuit || backoff {
+            "degraded".into()
+        } else if !logged_in {
+            "starting".into()
+        } else {
+            status
+        },
         service: "NWAFU DeepSeek Proxy",
         target: state.settings.target_base.clone(),
         api_base: format!("http://localhost:{}/v1", state.settings.proxy_port),
+        note: Some(format!(
+            "circuit={} backoff={} logged_in={} consecutive_failures={} last_ok={last_ok_ago}s | {}",
+            if circuit { "open" } else { "ok" },
+            if backoff { "active" } else { "ok" },
+            logged_in,
+            consecutive,
+            note.unwrap_or_default()
+        )),
+        auth_state: Some(if circuit {
+            "circuit_open"
+        } else if backoff {
+            "backoff"
+        } else if logged_in {
+            "ok"
+        } else {
+            "expired"
+        }.into()),
+        latency_ms: Some(latency),
+        upstream_status,
     })
 }
 
@@ -356,6 +718,7 @@ async fn proxy_http(state: AppState, req: Request<Body>) -> Result<Response<Body
                 "upstream authentication session was not accepted",
             ));
         }
+        let _ = state.auth.force_relogin().await;
         return Ok(json_error(
             StatusCode::UNAUTHORIZED,
             "auth_expired",
@@ -412,12 +775,35 @@ fn is_auth_redirect(resp: &reqwest::Response) -> bool {
     let Ok(location) = location.to_str() else {
         return false;
     };
-    if let Ok(url) = Url::parse(location) {
-        return url.host_str() == Some("authserver.nwafu.edu.cn")
-            && url.path().starts_with("/authserver/login")
-            || url.path().starts_with("/.auth/login/cas");
+    is_cas_login_url(location)
+}
+
+fn is_cas_login_url(url_str: &str) -> bool {
+    if url_str.is_empty() {
+        return false;
     }
-    location.starts_with("/.auth/login/cas")
+    if url_str.starts_with("/.auth/login/cas") {
+        return true;
+    }
+    if let Ok(url) = Url::parse(url_str) {
+        return url.host_str() == Some("authserver.nwafu.edu.cn")
+            && url.path().starts_with("/authserver/login");
+    }
+    false
+}
+
+fn generate_totp(secret: &[u8]) -> u32 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let counter = (now / 30).to_be_bytes();
+    let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC can take key of any size");
+    mac.update(&counter);
+    let result = mac.finalize().into_bytes();
+    let offset = (result[19] & 0xf) as usize;
+    let code = u32::from_be_bytes(result[offset..offset + 4].try_into().unwrap()) & 0x7fff_ffff;
+    code % 1_000_000
 }
 
 async fn response_from_reqwest(
@@ -672,6 +1058,10 @@ async fn main() -> Result<()> {
     if let Err(err) = state.auth.ensure_login().await {
         warn!("event=initial_login_failed error={}", err);
     }
+
+    // Start background keepalive
+    state.auth.clone().start_keepalive().await;
+    info!("event=keepalive_started interval={:?}", KEEPALIVE_INTERVAL);
 
     let app = Router::new()
         .route("/health", get(health))

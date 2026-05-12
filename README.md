@@ -6,12 +6,12 @@
 
 本项目通过在本地运行一个 **透明反向代理** 来解决该问题：
 
-1. 启动时自动完成 CAS 认证（包括 AES 密码加密、表单提交、ticket 兑换）
+1. 启动时自动完成 CAS 认证（包括 AES 密码加密、表单提交、ticket 兑换、TOTP 二次验证）
 2. 获取到目标站点的有效 session cookie
 3. 在本地暴露 `http://localhost:8000`，**透明转发所有请求到源站**
 4. 所有经过代理的请求会自动附带 CAS cookie + Open WebUI API Key
 5. 后台定时保活，cookie 过期时自动刷新
-6. 多层账号保护机制：状态机、单飞锁、频率限制、指数退避、熔断器
+6. 多层账号保护机制：状态机、单飞锁、频率限制、指数退避、熔断器、登录间隔限制、force_relogin 限流
 
 代理不对任何请求做特殊处理；源站支持的能力将被原样透传。直接将浏览器指向 `localhost:8000` 即可使用完整的 Open WebUI，包括聊天、模型管理等功能。
 
@@ -43,7 +43,8 @@ cp .env.example .env
 |------|------|----------|
 | `NWAFU_USERNAME` | 学号 | — |
 | `NWAFU_PASSWORD` | 统一身份认证密码 | 密码含 `#` 等字符时用双引号包裹 |
-| `OPENWEBUI_API_KEY` | Open WebUI 的 API 密钥 | 登录 Open WebUI，在“个人设置 / 账号 / API 密钥”中生成 |
+| `OPENWEBUI_API_KEY` | Open WebUI 的 API 密钥 | 登录 Open WebUI，在”个人设置 / 账号 / API 密钥”中生成 |
+| `TOTP_SECRET` | TOTP 安全令牌密钥 | 从认证器 APP 获取 Base32 密钥（可选但推荐） |
 
 ### 启动
 
@@ -156,7 +157,9 @@ deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
 2. 使用与前端一致的 AES-CBC (PKCS7 padding) 加密密码：`randomString(64) + password`
 3. `POST /authserver/login` 提交表单
 4. 跟随 302 重定向链：AuthServer 到 CAS callback（携带 ST ticket）再到目标站
-5. 在重定向过程中收集 session cookie
+5. **检测二次验证跳转**：若重定向到 `reAuthLoginView.do?isMultifactor=true`，自动切换至安全令牌 (TOTP) 并提交验证码
+6. **登录后会话验证**：确认目标站可达且未被重定向回 CAS
+7. 在重定向过程中收集 session cookie
 
 ### 账号保护机制
 
@@ -165,10 +168,13 @@ deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
 | 层级 | 机制 | 说明 |
 |------|------|------|
 | 1 | 登录后拒绝抑制 | 登录成功后短时间内仍被认证中间件拒绝时，不连续触发 CAS 登录 |
-| 2 | 单飞锁 | 并发请求最多触发一次真实 CAS 登录 |
-| 3 | 频率限制 | 每小时最多 6 次登录尝试 |
-| 4 | 指数退避 | 登录失败后退避时间递增（5s → 20s → 80s → 15min） |
-| 5 | 熔断器 | 连续 3 次失败后熔断 15 分钟 |
+| 2 | force_relogin 限流 | 10s 内重复 force_relogin 请求被忽略 |
+| 3 | 单飞锁 | 并发请求最多触发一次真实 CAS 登录 |
+| 4 | 频率限制 | 每小时最多 6 次登录尝试 |
+| 5 | 最小间隔 | 两次登录之间不少于 60s 冷却 |
+| 6 | 指数退避 | 登录失败后退避时间递增（5s → 20s → 80s → 15min）；TOTP 失败用固定 30s |
+| 7 | 熔断器 | 连续 3 次失败后熔断 15 分钟 |
+| 8 | 会话验证 | 登录成功后立即 HEAD 目标站验证会话有效性 |
 
 ## 配置项一览
 
@@ -177,9 +183,20 @@ deepseek.nwafu.edu.cn  ← 学校 Open WebUI 实例
 | `NWAFU_USERNAME` | 是 | — | 学号 |
 | `NWAFU_PASSWORD` | 是 | — | 密码 |
 | `OPENWEBUI_API_KEY` | 是 | — | Open WebUI API Key |
+| `TOTP_SECRET` | | — | TOTP 安全令牌密钥（Base32），用于自动二次验证 |
 | `PROXY_PORT` | | `8000` | 代理监听端口 |
 | `TARGET_HOST` | | `deepseek.nwafu.edu.cn` | 目标 Open WebUI 域名 |
 | `AUTH_SERVER` | | `https://authserver.nwafu.edu.cn` | AuthServer 地址 |
+
+## 二次验证 (TOTP)
+
+自 2026-05-12 起，NWAFU 统一身份认证启用二次验证。配置 `TOTP_SECRET` 后代理可自动完成：
+
+1. 从认证器 APP（Google Authenticator / Microsoft Authenticator / Authy）获取 NWAFU 账户的 TOTP 密钥
+2. 在 `.env` 中设置 `TOTP_SECRET=你的base32密钥`
+3. 代理登录时自动切换至安全令牌方式并提交 TOTP 验证码
+
+支持格式：纯 Base32、`otpauth://` URL、含空格字符串（自动清洗）。未配置时登录会在二次验证步骤失败并进入退避。
 
 ## 常见问题
 
