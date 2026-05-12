@@ -8,7 +8,7 @@ use std::{
 use aes::Aes128;
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
@@ -51,6 +51,7 @@ const LOGIN_WINDOW: Duration = Duration::from_secs(3600);
 const MAX_LOGIN_REDIRECTS: usize = 10;
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 const REWRITE_LIMIT: usize = 5 * 1024 * 1024;
+const LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const AES_CHARS: &[u8] = b"ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678";
 
 #[derive(Clone)]
@@ -110,6 +111,7 @@ struct AuthManager {
     client: Client,
     cookie_jar: Arc<Jar>,
     state: Mutex<AuthState>,
+    login_lock: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -140,6 +142,7 @@ impl AuthManager {
             client,
             cookie_jar,
             state: Mutex::new(AuthState::default()),
+            login_lock: Mutex::new(()),
         })
     }
 
@@ -151,6 +154,7 @@ impl AuthManager {
             }
         }
 
+        let _login_guard = self.login_lock.lock().await;
         let mut state = self.state.lock().await;
         if state.last_login.is_some_and(|t| t.elapsed() < COOKIE_TTL) {
             return Ok(());
@@ -482,6 +486,7 @@ impl AuthManager {
                 }
             }
             state.last_force_relogin_time = Some(now);
+            state.last_login = None;
         }
         warn!("event=force_relogin requested");
         self.ensure_login().await
@@ -701,8 +706,12 @@ async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> imp
     }
 }
 
+enum ProxyOnce {
+    Response(Response<Body>),
+    AuthExpired,
+}
+
 async fn proxy_http(state: AppState, req: Request<Body>) -> Result<Response<Body>> {
-    state.auth.ensure_login().await?;
     let uri = req.uri().clone();
     let target_url = build_target_url(&state.settings, &uri)?;
     let method = req.method().clone();
@@ -711,9 +720,61 @@ async fn proxy_http(state: AppState, req: Request<Body>) -> Result<Response<Body
         .await
         .context("failed to read request body")?;
 
+    for attempt in 0..2 {
+        state.auth.ensure_login().await?;
+        match proxy_once(
+            &state,
+            method.clone(),
+            target_url.clone(),
+            uri.path(),
+            &headers,
+            body.clone(),
+        )
+        .await?
+        {
+            ProxyOnce::Response(resp) => return Ok(resp),
+            ProxyOnce::AuthExpired => {
+                if state.auth.recent_login_rejected().await {
+                    return Ok(json_error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_auth_session_rejected",
+                        "upstream authentication session was not accepted",
+                    ));
+                }
+                if attempt == 0 {
+                    state.auth.force_relogin().await?;
+                    continue;
+                }
+                return Ok(json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "auth_expired",
+                    "authentication expired",
+                ));
+            }
+        }
+    }
+
+    Ok(json_error(
+        StatusCode::BAD_GATEWAY,
+        "proxy_exhausted",
+        "proxy request exhausted",
+    ))
+}
+
+async fn proxy_once(
+    state: &AppState,
+    method: axum::http::Method,
+    target_url: Url,
+    target_path: &str,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<ProxyOnce> {
     let mut upstream = state.auth.client.request(method, target_url.clone());
+    if needs_long_timeout(target_path) {
+        upstream = upstream.timeout(LONG_REQUEST_TIMEOUT);
+    }
     upstream = upstream.header(reqwest::header::HOST, state.settings.target_host.as_str());
-    if !state.settings.openwebui_api_key.is_empty() {
+    if !state.settings.openwebui_api_key.is_empty() && needs_api_key(target_path) {
         upstream = upstream.bearer_auth(&state.settings.openwebui_api_key);
     }
     for (name, value) in headers.iter() {
@@ -728,27 +789,42 @@ async fn proxy_http(state: AppState, req: Request<Body>) -> Result<Response<Body
     }
     let resp = upstream.body(body).send().await?;
     if is_auth_redirect(&resp) {
-        if state.auth.recent_login_rejected().await {
-            return Ok(json_error(
-                StatusCode::BAD_GATEWAY,
-                "upstream_auth_session_rejected",
-                "upstream authentication session was not accepted",
-            ));
+        return Ok(ProxyOnce::AuthExpired);
+    }
+    if is_possible_cas_login_html(&resp) {
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp.bytes().await?;
+        if sample_contains_cas_fields(&bytes) {
+            return Ok(ProxyOnce::AuthExpired);
         }
-        let _ = state.auth.force_relogin().await;
-        return Ok(json_error(
-            StatusCode::UNAUTHORIZED,
-            "auth_expired",
-            "authentication expired",
-        ));
+        return Ok(ProxyOnce::Response(response_from_parts(
+            status,
+            &headers,
+            bytes,
+            &state.settings,
+        )?));
     }
 
-    response_from_reqwest(resp, &state.settings).await
+    Ok(ProxyOnce::Response(
+        response_from_reqwest(resp, &state.settings).await?,
+    ))
 }
 
 fn build_target_url(settings: &Settings, uri: &Uri) -> Result<Url> {
     let path = uri.path_and_query().map(|v| v.as_str()).unwrap_or("/");
     Url::parse(&format!("{}{}", settings.target_base, path)).context("invalid target URL")
+}
+
+fn needs_long_timeout(path: &str) -> bool {
+    path.starts_with("/api/chat/completions")
+        || path.starts_with("/v1/chat/completions")
+        || path.starts_with("/ollama")
+        || path.starts_with("/openai")
+}
+
+fn needs_api_key(path: &str) -> bool {
+    path.starts_with("/v1/") || path.starts_with("/openai/") || path.starts_with("/ollama/")
 }
 
 fn should_skip_request_header(name: &HeaderName) -> bool {
@@ -795,6 +871,23 @@ fn is_auth_redirect(resp: &reqwest::Response) -> bool {
     is_cas_login_url(location)
 }
 
+fn is_possible_cas_login_html(resp: &reqwest::Response) -> bool {
+    matches!(resp.status().as_u16(), 401 | 403)
+        && resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.to_ascii_lowercase().contains("text/html"))
+            .unwrap_or(false)
+}
+
+fn sample_contains_cas_fields(body: &[u8]) -> bool {
+    let sample_len = body.len().min(4096);
+    let sample = String::from_utf8_lossy(&body[..sample_len]).to_ascii_lowercase();
+    (sample.contains(r#"id="execution""#) || sample.contains("id='execution'"))
+        && (sample.contains(r#"id="pwdencryptsalt""#) || sample.contains("id='pwdencryptsalt'"))
+}
+
 fn is_cas_login_url(url_str: &str) -> bool {
     if url_str.is_empty() {
         return false;
@@ -835,31 +928,18 @@ async fn response_from_reqwest(
     resp: reqwest::Response,
     settings: &Settings,
 ) -> Result<Response<Body>> {
-    let status = StatusCode::from_u16(resp.status().as_u16())?;
+    let status = resp.status();
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let mut builder = Response::builder().status(status);
-    for (name, value) in resp.headers() {
-        if should_skip_response_header(name) {
-            continue;
-        }
-        let name = HeaderName::from_bytes(name.as_str().as_bytes())?;
-        let mut value = HeaderValue::from_bytes(value.as_bytes())?;
-        if name == header::LOCATION {
-            if let Ok(text) = value.to_str() {
-                let local = format!("http://localhost:{}", settings.proxy_port);
-                value = HeaderValue::from_str(&text.replace(&settings.target_base, &local))?;
-            }
-        }
-        builder = builder.header(name, value);
-    }
+    let headers = resp.headers().clone();
 
     // 流式响应（SSE）：转发字节流，不缓冲
     if is_streaming_response(&resp) {
+        let builder = response_builder(status, &headers, settings)?;
         let stream = resp.bytes_stream();
         let body = Body::from_stream(stream.map(|chunk| {
             chunk.map_err(|e| {
@@ -870,6 +950,30 @@ async fn response_from_reqwest(
     }
 
     let bytes = resp.bytes().await?;
+    response_from_parts_with_content_type(status, &headers, bytes, settings, &content_type)
+}
+
+fn response_from_parts(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    bytes: Bytes,
+    settings: &Settings,
+) -> Result<Response<Body>> {
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    response_from_parts_with_content_type(status, headers, bytes, settings, content_type)
+}
+
+fn response_from_parts_with_content_type(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    bytes: Bytes,
+    settings: &Settings,
+    content_type: &str,
+) -> Result<Response<Body>> {
+    let builder = response_builder(status, headers, settings)?;
     let body = if should_rewrite_body(&content_type) && bytes.len() <= REWRITE_LIMIT {
         let local = format!("http://localhost:{}", settings.proxy_port);
         let target_origin = format!("https://{}", settings.target_host);
@@ -884,6 +988,29 @@ async fn response_from_reqwest(
         bytes.to_vec()
     };
     Ok(builder.body(Body::from(body))?)
+}
+
+fn response_builder(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    settings: &Settings,
+) -> Result<axum::http::response::Builder> {
+    let mut builder = Response::builder().status(StatusCode::from_u16(status.as_u16())?);
+    for (name, value) in headers {
+        if should_skip_response_header(name) {
+            continue;
+        }
+        let name = HeaderName::from_bytes(name.as_str().as_bytes())?;
+        let mut value = HeaderValue::from_bytes(value.as_bytes())?;
+        if name == header::LOCATION {
+            if let Ok(text) = value.to_str() {
+                let local = format!("http://localhost:{}", settings.proxy_port);
+                value = HeaderValue::from_str(&text.replace(&settings.target_base, &local))?;
+            }
+        }
+        builder = builder.header(name, value);
+    }
+    Ok(builder)
 }
 
 fn should_rewrite_body(content_type: &str) -> bool {
@@ -963,13 +1090,6 @@ async fn proxy_ws(state: AppState, mut client_ws: WebSocket, uri: Uri, headers: 
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         ),
     );
-    // API Key
-    if !state.settings.openwebui_api_key.is_empty() {
-        let value = format!("Bearer {}", state.settings.openwebui_api_key);
-        request
-            .headers_mut()
-            .insert("Authorization", HeaderValue::from_str(&value).unwrap());
-    }
     // Session cookies — use https:// URL for lookup (cookies set via HTTPS)
     let cookie_url = target.replacen("wss://", "https://", 1);
     if let Ok(url) = Url::parse(&cookie_url) {
