@@ -888,7 +888,7 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| proxy_ws(state, socket, uri, headers))
 }
 
-async fn proxy_ws(state: AppState, client_ws: WebSocket, uri: Uri, headers: HeaderMap) {
+async fn proxy_ws(state: AppState, mut client_ws: WebSocket, uri: Uri, headers: HeaderMap) {
     if let Err(err) = state.auth.ensure_login().await {
         warn!("event=ws_auth_failed error={}", err);
         return;
@@ -907,9 +907,16 @@ async fn proxy_ws(state: AppState, client_ws: WebSocket, uri: Uri, headers: Head
             return;
         }
     };
+    // 设置 Origin / Authorization / Cookie / User-Agent（对齐 Python 版）
     request.headers_mut().insert(
         "Origin",
         HeaderValue::from_str(&state.settings.target_base).unwrap(),
+    );
+    request.headers_mut().insert(
+        "User-Agent",
+        HeaderValue::from_static(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        ),
     );
     if !state.settings.openwebui_api_key.is_empty() {
         let value = format!("Bearer {}", state.settings.openwebui_api_key);
@@ -930,10 +937,16 @@ async fn proxy_ws(state: AppState, client_ws: WebSocket, uri: Uri, headers: Head
             .insert(header::SEC_WEBSOCKET_PROTOCOL, protocol.clone());
     }
 
-    let Ok((upstream_ws, _)) = connect_async_tls_with_config(request, None, false, None).await
-    else {
-        warn!("event=ws_upstream_rejected path={}", uri.path());
-        return;
+    let upstream_ws = match connect_async_tls_with_config(request, None, false, None).await {
+        Ok((ws, resp)) => {
+            debug!("event=ws_upstream_connected path={} status={}", uri.path(), resp.status());
+            ws
+        }
+        Err(err) => {
+            warn!("event=ws_upstream_rejected path={} error={}", uri.path(), err);
+            let _ = client_ws.close().await;
+            return;
+        }
     };
     let (mut client_tx, mut client_rx) = client_ws.split();
     let (mut upstream_tx, mut upstream_rx) = upstream_ws.split();
