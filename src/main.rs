@@ -823,6 +823,14 @@ fn generate_totp(secret: &[u8]) -> u32 {
     code % 1_000_000
 }
 
+fn is_streaming_response(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
 async fn response_from_reqwest(
     resp: reqwest::Response,
     settings: &Settings,
@@ -849,6 +857,18 @@ async fn response_from_reqwest(
         }
         builder = builder.header(name, value);
     }
+
+    // 流式响应（SSE）：转发字节流，不缓冲
+    if is_streaming_response(&resp) {
+        let stream = resp.bytes_stream();
+        let body = Body::from_stream(stream.map(|chunk| {
+            chunk.map_err(|e| {
+                axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+            })
+        }));
+        return Ok(builder.body(body)?);
+    }
+
     let bytes = resp.bytes().await?;
     let body = if should_rewrite_body(&content_type) && bytes.len() <= REWRITE_LIMIT {
         let local = format!("http://localhost:{}", settings.proxy_port);
