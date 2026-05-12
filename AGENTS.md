@@ -18,13 +18,13 @@ docker compose down     # Stop
 
 **Verify models:**
 ```bash
-python list_models.py
+python utils/list_models.py
 ```
 
 **Test API endpoint:**
 ```bash
-python test_api.py                  # Auto-select first chat model
-python test_api.py Qwen3-235B-A22B  # Specific model
+python utils/test_api.py                  # Auto-select first chat model
+python utils/test_api.py Qwen3-235B-A22B  # Specific model
 ```
 
 ## Environment Setup
@@ -54,8 +54,8 @@ python test_api.py Qwen3-235B-A22B  # Specific model
 **Entry points:**
 - `server.py` - Main FastAPI application (~1300 lines, full reverse proxy)
 - `utils/model_monitor.py` - Optional model change monitor (enabled via `MONITOR_ENABLED=true`)
-- `list_models.py` - Model listing utility
-- `test_api.py` - End-to-end connectivity test
+- `utils/list_models.py` - Model listing utility
+- `utils/test_api.py` - End-to-end connectivity test
 
 **Core flow:**
 1. Client -> `localhost:8000/*` -> FastAPI proxy

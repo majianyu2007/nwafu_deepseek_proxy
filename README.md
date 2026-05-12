@@ -84,14 +84,14 @@ docker compose down
 列出模型：
 
 ```bash
-python list_models.py
+python utils/list_models.py
 ```
 
 发送测试对话：
 
 ```bash
-python test_api.py
-python test_api.py Qwen3-235B-A22B
+python utils/test_api.py
+python utils/test_api.py Qwen3-235B-A22B
 ```
 
 也可以直接用 curl：
@@ -229,7 +229,7 @@ NOTIFY_PROXY=
 
 **Model not found**
 
-运行 `python list_models.py` 查看实际上游模型 ID。
+运行 `python utils/list_models.py` 查看实际上游模型 ID。
 
 **浏览器出现 HTTPS localhost 相关错误**
 

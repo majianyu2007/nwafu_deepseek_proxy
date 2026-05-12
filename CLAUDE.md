@@ -17,12 +17,12 @@ docker compose up -d       # start
 docker compose down        # stop
 
 # Verify connectivity
-python list_models.py      # list available models
-python test_api.py          # streaming chat test (auto-selects first chat model)
-python test_api.py <model>  # test with a specific model
+python utils/list_models.py      # list available models
+python utils/test_api.py          # streaming chat test (auto-selects first chat model)
+python utils/test_api.py <model>  # test with a specific model
 ```
 
-No test suite, linter, or type-checker is configured. `test_api.py` serves as the manual end-to-end smoke test.
+No test suite, linter, or type-checker is configured. `utils/test_api.py` serves as the manual end-to-end smoke test.
 
 ## Architecture
 
@@ -98,6 +98,6 @@ Clients can use any placeholder API key (e.g., `sk-any`) — the proxy injects t
 | `server.py` | Main application: auth, proxy, routes, TOTP 2FA |
 | `utils/model_monitor.py` | Optional model change monitor |
 | `static/monitor.html` | Monitor dashboard (only if MONITOR_ENABLED) |
-| `list_models.py` | CLI utility to list available models |
-| `test_api.py` | Manual E2E streaming chat test |
+| `utils/list_models.py` | CLI utility to list available models |
+| `utils/test_api.py` | Manual E2E streaming chat test |
 | `.data/` | Persistent state directory (login rate limit, circuit state) |
