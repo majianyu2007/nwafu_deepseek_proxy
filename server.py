@@ -187,6 +187,10 @@ def _is_streaming_path(path: str) -> bool:
     return any(path.startswith(p) for p in _STREAMING_PATH_PREFIXES)
 
 
+def _needs_long_timeout(path: str) -> bool:
+    return _is_streaming_path(path)
+
+
 # ============================================================
 # 配置
 # ============================================================
@@ -705,6 +709,7 @@ class AuthSessionManager:
         self._last_force_relogin_time = now
         logger.warning("event=force_relogin requested — 检测到明确的 CAS 会话失效")
         self._transition(AuthState.EXPIRED, "force_relogin:definitive_cas_redirect")
+        self._last_login_time = 0
         try:
             return await self.ensure_login()
         except (CircuitOpenError, UpstreamUnavailableError):
@@ -1265,7 +1270,15 @@ def _build_target_url(request: Request, target_path: str) -> str:
     return target_url
 
 
-def _build_forward_headers(request: Request) -> dict[str, str]:
+def _needs_api_key(path: str) -> bool:
+    return (
+        path.startswith("/v1/")
+        or path.startswith("/openai/")
+        or path.startswith("/ollama/")
+    )
+
+
+def _build_forward_headers(request: Request, target_path: str) -> dict[str, str]:
     headers = {}
     for k, v in request.headers.items():
         kl = k.lower()
@@ -1277,7 +1290,11 @@ def _build_forward_headers(request: Request) -> dict[str, str]:
         else:
             headers[k] = v
     headers["Host"] = TARGET_HOST
-    if OPENWEBUI_API_KEY:
+    # 浏览器内的 OpenWebUI /api/* 请求依赖 CAS session cookie 和同一条
+    # Socket.IO 会话接收异步任务结果。强行注入 API key 可能让任务归属到
+    # token auth 上，而页面的 websocket 仍归属 cookie session，导致 WebUI
+    # 只拿到 task_id 但迟迟收不到回复。
+    if OPENWEBUI_API_KEY and _needs_api_key(target_path):
         headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
     return headers
 
@@ -1345,11 +1362,12 @@ async def _forward(
     headers: dict[str, str],
     body: bytes,
     is_stream: bool,
+    long_timeout: bool,
     force_timeout: Optional[httpx.Timeout] = None,
 ) -> Response | object:
     if force_timeout is not None:
         timeout = force_timeout
-    elif is_stream:
+    elif is_stream or long_timeout:
         timeout = STREAM_TIMEOUT
     else:
         timeout = DEFAULT_TIMEOUT
@@ -1375,8 +1393,35 @@ async def _forward(
         for k, v in resp_headers.items()
     }
     media_type = resp.headers.get("content-type", "text/event-stream" if is_stream else None)
+    response_is_sse = "text/event-stream" in (media_type or "").lower()
+    if response_is_sse or long_timeout:
+        resp_headers.setdefault("Cache-Control", "no-cache")
+        resp_headers.setdefault("X-Accel-Buffering", "no")
+    logger.info(
+        "event=upstream_headers status=%d content_type=%s request_stream=%s long_timeout=%s",
+        resp.status_code,
+        media_type or "",
+        "true" if is_stream else "false",
+        "true" if long_timeout else "false",
+    )
 
-    rewritten_body = await _rewrite_response_body(resp, media_type or "", is_stream)
+    # 模型/生成类端点必须尽快把上游字节交给客户端。即使不是标准
+    # text/event-stream，也不能为了 URL 重写而先读完整响应，否则前端/API
+    # 会表现为长时间没有任何内容返回。
+    should_buffer_for_rewrite = not long_timeout or (
+        long_timeout and not response_is_sse and "application/json" in (media_type or "").lower()
+    )
+    rewritten_body = None
+    if should_buffer_for_rewrite:
+        rewritten_body = await _rewrite_response_body(resp, media_type or "", response_is_sse)
+        if long_timeout and not response_is_sse and rewritten_body is not None:
+            preview = rewritten_body[:500].decode("utf-8", errors="replace").replace("\n", "\\n")
+            logger.warning(
+                "event=model_non_sse_response status=%d content_type=%s body_preview=%s",
+                resp.status_code,
+                media_type or "",
+                preview,
+            )
     if rewritten_body is not None:
         await resp.aclose()
         return Response(
@@ -1386,13 +1431,19 @@ async def _forward(
             media_type=media_type,
         )
 
-    # 如果 body 被采样过（CAS 检测），需要将采样的字节前置
+    # 如果 CAS 检测读取过 body，httpx 响应流已经被消费，直接返回采样内容。
     sampled_body = getattr(resp, "_sampled_body", None)
+    if sampled_body is not None:
+        await resp.aclose()
+        return Response(
+            content=sampled_body,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=media_type,
+        )
 
     async def stream_generator():
         try:
-            if sampled_body:
-                yield sampled_body
             async for chunk in resp.aiter_bytes():
                 yield chunk
         except (httpx.ReadError, httpx.RemoteProtocolError, httpx.TransportError) as e:
@@ -1415,9 +1466,9 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
     t0 = time.monotonic()
     body, is_stream = await _read_request_body(request)
 
-    # 也根据 URL path 判断是否流式端点
-    path_is_streaming = _is_streaming_path(target_path)
-    effective_stream = is_stream or path_is_streaming
+    # 对话/生成类端点可能很慢，但不一定是 SSE。是否流式只由请求体
+    # stream=true 或上游 Content-Type 决定，避免把普通 JSON 响应误当成流。
+    long_timeout = _needs_long_timeout(target_path)
 
     # 上游降级模式：最近多个请求失败时使用短超时，避免客户端长时间等待
     degraded = session_mgr.is_degraded()
@@ -1439,7 +1490,7 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
             return _error_response(503, "登录失败，请稍后重试", error_type="login_failed")
 
         target_url = _build_target_url(request, target_path)
-        headers = _build_forward_headers(request)
+        headers = _build_forward_headers(request, target_path)
 
         # 降级模式下使用短超时，避免客户端长时间挂起
         req_timeout = DEGRADED_TIMEOUT if degraded else None
@@ -1451,7 +1502,8 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
                 url=target_url,
                 headers=headers,
                 body=body,
-                is_stream=effective_stream,
+                is_stream=is_stream,
+                long_timeout=long_timeout,
                 force_timeout=req_timeout,
             )
 
@@ -1500,7 +1552,7 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
                 request.method,
                 target_path,
                 status_code,
-                "true" if effective_stream else "false",
+                "true" if is_stream else "false",
                 elapsed,
             )
             return result
@@ -1605,8 +1657,6 @@ async def _proxy_websocket(client_ws: WebSocket, target_path: str):
     # 准备上游请求头。Host / Origin / User-Agent 属于 WebSocket 握手头，
     # 交给 websockets 通过专用参数生成，避免重复头导致上游返回 400。
     extra_headers = {}
-    if OPENWEBUI_API_KEY:
-        extra_headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
 
     cookie_str = _get_cookie_header(http_client, target_url)
     if cookie_str:
@@ -1653,8 +1703,10 @@ async def _proxy_websocket(client_ws: WebSocket, target_path: str):
                         data = await client_ws.receive()
                         if data["type"] == "websocket.receive":
                             if "text" in data:
+                                logger.debug("event=ws_frame direction=client_to_upstream type=text len=%d", len(data["text"]))
                                 await upstream_ws.send(data["text"])
                             elif "bytes" in data:
+                                logger.debug("event=ws_frame direction=client_to_upstream type=bytes len=%d", len(data["bytes"]))
                                 await upstream_ws.send(data["bytes"])
                         elif data["type"] == "websocket.disconnect":
                             break
@@ -1671,8 +1723,10 @@ async def _proxy_websocket(client_ws: WebSocket, target_path: str):
                 try:
                     async for message in upstream_ws:
                         if isinstance(message, str):
+                            logger.debug("event=ws_frame direction=upstream_to_client type=text len=%d", len(message))
                             await client_ws.send_text(message)
                         elif isinstance(message, bytes):
+                            logger.debug("event=ws_frame direction=upstream_to_client type=bytes len=%d", len(message))
                             await client_ws.send_bytes(message)
                 except asyncio.CancelledError:
                     raise
