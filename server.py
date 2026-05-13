@@ -2334,6 +2334,9 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
             _monitor = create_monitor(_settings, lambda: manager.state in (AuthState.OK, AuthState.SUSPECT))
             register_monitor_routes(_app, _monitor)
             manager._monitor = _monitor
+            n_routes = len(_app.routes)
+            monitor_routes = [r.path for r in _app.routes if "monitor" in str(getattr(r, "path", ""))]
+            logger.info("模型监控路由已注册（共 %d 条路由, monitor=%s）", n_routes, monitor_routes)
         except Exception as e:
             logger.error("模型监控初始化失败：%s", e)
 
