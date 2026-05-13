@@ -31,7 +31,7 @@ import websockets
 from websockets.asyncio.client import connect as websocket_connect
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Form, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from dotenv import load_dotenv
@@ -388,6 +388,11 @@ class AuthSessionManager:
         self._backoff_until: float = 0
         self._circuit_until: float = 0
         self._circuit_duration: float = 0
+
+        # TOTP 用户输入等待
+        self._totp_pending: bool = False
+        self._totp_code: Optional[str] = None
+        self._totp_ready: asyncio.Event = asyncio.Event()
 
         # 上游降级检测（与认证状态机独立）
         self._recent_proxy_failures: list[float] = []  # 最近代理请求失败的时间戳
@@ -1208,33 +1213,56 @@ class AuthSessionManager:
                     change_data.get("data", {}).get("reAuthTypeName", "?"))
 
         # Step 2: 生成 TOTP 码
-        if not TOTP_SECRET:
-            raise RuntimeError(
-                "检测到二次验证要求，但未配置 TOTP_SECRET。"
-                "请从认证器 APP 中获取 TOTP 密钥并填入 .env 文件"
-            )
-        if os.getenv("TOTP_AUTO_ENABLED", "true").strip().lower() != "true":
-            raise RuntimeError(
-                "检测到二次验证要求，TOTP_AUTO_ENABLED=false，"
-                "请手动完成二次验证后重启代理"
-            )
-        # 兼容多种 secret 格式：纯 base32、otpauth:// URL、含空格的
-        secret = TOTP_SECRET.strip()
+        auto_enabled = os.getenv("TOTP_AUTO_ENABLED", "true").strip().lower() == "true"
+        secret = TOTP_SECRET.strip() if TOTP_SECRET else ""
+
+        # 兼容多种格式
         if secret.startswith("otpauth://"):
-            # 从 otpauth URL 中提取 secret 参数
             _q = urlparse(secret).query
             _params = parse_qs(_q)
-            secret = _params.get("secret", [secret])[0]
-        # 移除可能混入的空格和换行
-        secret = re.sub(r"\s+", "", secret)
-        totp = pyotp.TOTP(secret)
-        await _wait_for_stable_totp_window()
-        otp_code = totp.now()
-        logger.info(
-            "event=2fa_totp_generated code=%s**** window_remaining=%ds",
-            otp_code[:2],
-            _totp_window_remaining_seconds(),
-        )
+            secret = re.sub(r"\s+", "", _params.get("secret", [secret])[0])
+        else:
+            secret = re.sub(r"\s+", "", secret)
+
+        totp = pyotp.TOTP(secret) if secret else None
+
+        if totp and auto_enabled:
+            # 自动模式：生成 TOTP 码
+            await _wait_for_stable_totp_window()
+            otp_code = totp.now()
+            logger.info(
+                "event=2fa_totp_generated code=%s**** window_remaining=%ds",
+                otp_code[:2],
+                _totp_window_remaining_seconds(),
+            )
+        else:
+            # 手动模式：等待用户通过 /totp 页面提交
+            if not secret:
+                logger.warning(
+                    "event=2fa_manual_wait note=TOTP_SECRET未配置，"
+                    "请在浏览器访问 http://localhost:%d/totp 输入TOTP码",
+                    PROXY_PORT,
+                )
+            else:
+                logger.warning(
+                    "event=2fa_manual_wait note=TOTP_AUTO_ENABLED=false，"
+                    "请在浏览器访问 http://localhost:%d/totp 输入TOTP码",
+                    PROXY_PORT,
+                )
+            self._totp_code = None
+            self._totp_ready.clear()
+            self._totp_pending = True
+
+            try:
+                await asyncio.wait_for(self._totp_ready.wait(), timeout=300)
+                otp_code = self._totp_code
+                if not otp_code or not otp_code.strip():
+                    raise RuntimeError("未收到 TOTP 码")
+                otp_code = otp_code.strip()
+            except asyncio.TimeoutError:
+                raise RuntimeError("等待 TOTP 输入超时（5 分钟）")
+            finally:
+                self._totp_pending = False
 
         # Step 3: 提交二次验证
         submit_body = {
@@ -1387,6 +1415,27 @@ class AuthSessionManager:
                 await asyncio.wait_for(self._client.aclose(), timeout=2.0)
             except asyncio.TimeoutError:
                 pass
+
+
+    def submit_totp(self, code: str) -> bool:
+        """接收用户提交的 TOTP 码。成功返回 True。"""
+        if not self._totp_pending:
+            return False
+        self._totp_code = code.strip()
+        self._totp_ready.set()
+        logger.info("event=totp_code_submitted")
+        return True
+
+    @property
+    def totp_pending(self) -> bool:
+        return self._totp_pending
+
+    @property
+    def totp_remaining(self) -> int | None:
+        """当前 TOTP 窗口剩余秒数（供前端显示）"""
+        if not self._totp_pending:
+            return None
+        return 30 - (int(time.time()) % 30)
 
 
 # ---- 全局会话管理器 ----
@@ -2104,6 +2153,51 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @_app.get("/totp")
+    async def totp_page():
+        """TOTP 二次验证码输入页面"""
+        if not manager.totp_pending:
+            return HTMLResponse("""
+            <html><head><meta charset="utf-8"><title>TOTP</title>
+            <style>body{font:14px system-ui;max-width:360px;margin:40px auto;text-align:center}
+            input{font-size:20px;padding:8px;width:120px;text-align:center;letter-spacing:4px}
+            button{font-size:16px;padding:8px 24px;margin-top:10px;cursor:pointer}
+            .hint{color:#888;font-size:12px;margin-top:8px}</style></head>
+            <body><h3>无需输入</h3><p>当前没有等待中的二次验证。</p>
+            <p><a href="/health">查看状态</a></p></body></html>""")
+
+        remaining = manager.totp_remaining or 30
+        return HTMLResponse(f"""
+        <html><head><meta charset="utf-8"><title>TOTP 二次验证</title>
+        <style>body{{font:14px system-ui;max-width:360px;margin:40px auto;text-align:center}}
+        input{{font-size:24px;padding:10px;width:140px;text-align:center;letter-spacing:6px;border:2px solid #90138b;border-radius:6px}}
+        button{{font-size:16px;padding:10px 32px;margin-top:12px;cursor:pointer;background:#90138b;color:#fff;border:none;border-radius:6px}}
+        .timer{{color:#888;font-size:13px;margin-top:8px}}
+        .err{{color:#c00;font-size:13px;margin-top:6px}}</style></head>
+        <body><h3>输入 TOTP 安全令牌</h3>
+        <p style="color:#555">打开你的认证器 APP，找到 NWAFU 条目<br>输入当前显示的 6 位数字</p>
+        <form method="post" action="/totp" id="f">
+        <input type="text" name="code" id="c" maxlength="6" placeholder="000000" autofocus autocomplete="off" inputmode="numeric" pattern="[0-9]{{6}}" required>
+        <br><button type="submit">提交</button>
+        </form>
+        <div class="timer">当前窗口剩余 <span id="t">{remaining}</span> 秒</div>
+        <div class="err" id="e"></div>
+        <script>
+        var end = Date.now() + {remaining}*1000;
+        setInterval(function(){{var s=Math.max(0,Math.round((end-Date.now())/1000));document.getElementById('t').textContent=s}},500);
+        </script>
+        </body></html>""")
+
+    @_app.post("/totp")
+    async def totp_submit(code: str = Form(...)):
+        """接收用户提交的 TOTP 码"""
+        if not manager.totp_pending:
+            return HTMLResponse("<html><body><h3>无需提交</h3><p>当前没有等待中的二次验证。</p></body></html>")
+        success = manager.submit_totp(code)
+        if success:
+            return HTMLResponse("<html><head><meta charset='utf-8'></head><body><h3>TOTP 已提交</h3><p>代理正在继续登录，请稍候。</p></body></html>")
+        return HTMLResponse("<html><body><h3>提交失败</h3><p>请重试。</p></body></html>")
 
     @_app.get("/health")
     async def health(response: Response):
