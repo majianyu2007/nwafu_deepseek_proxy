@@ -31,7 +31,7 @@ import websockets
 from websockets.asyncio.client import connect as websocket_connect
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from fastapi import FastAPI, Form, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from dotenv import load_dotenv
@@ -2190,8 +2190,10 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
         </body></html>""")
 
     @_app.post("/totp")
-    async def totp_submit(code: str = Form(...)):
+    async def totp_submit(request: Request):
         """接收用户提交的 TOTP 码"""
+        form = await request.form()
+        code = form.get("code", "")
         if not manager.totp_pending:
             return HTMLResponse("<html><body><h3>无需提交</h3><p>当前没有等待中的二次验证。</p></body></html>")
         success = manager.submit_totp(code)
