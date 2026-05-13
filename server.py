@@ -1018,16 +1018,19 @@ class AuthSessionManager:
                 "lt": "",
                 "execution": execution,
             }
-            resp = await self._client.post(
+            resp = await self._retry_request(
+                "POST",
                 f"{AUTH_SERVER}/authserver/login",
                 data=form,
+                follow_redirects=False,
             )
-            logger.info("event=fido2_form_submit status=%d", resp.status_code)
+            post_status = resp.status_code
+            logger.info("event=fido2_form_submit status=%d", post_status)
 
-            if resp.status_code not in (301, 302, 307, 308):
+            if post_status not in (301, 302, 307, 308):
                 err_text = _extract_error_text(resp.text)
                 logger.warning("event=fido2_login_failed status=%d error=%s",
-                               resp.status_code, err_text or "unknown")
+                               post_status, err_text or "unknown")
                 return False
 
             # Follow redirects → TGC cookie set
