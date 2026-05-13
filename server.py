@@ -2102,6 +2102,7 @@ async def _proxy_websocket(client_ws: WebSocket, target_path: str):
 
 
 def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
+
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
         logger.info("服务启动：target=%s user=%s", TARGET_BASE, USERNAME)
@@ -2123,17 +2124,10 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
 
         await manager.start_keepalive()
 
-        # 模型监控（可选）
-        monitor = None
-        if _settings.monitor_enabled:
-            try:
-                from utils.model_monitor import create_monitor, register_monitor_routes
-                monitor = create_monitor(_settings, lambda: manager.state in (AuthState.OK, AuthState.SUSPECT))
-                register_monitor_routes(_app, monitor)
-                await monitor.start()
-                logger.info("模型监控已启用（间隔 %ds）", _settings.monitor_poll_interval)
-            except Exception as e:
-                logger.error("模型监控启动失败：%s", e)
+        monitor = getattr(manager, "_monitor", None)
+        if monitor:
+            await monitor.start()
+            logger.info("模型监控已启用（间隔 %ds）", _settings.monitor_poll_interval)
 
         yield
 
@@ -2332,6 +2326,16 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
         result["status"] = "ok"
         result["note"] = "代理已启动，会话尚未建立"
         return result
+
+    # 模型监控必须在 lifespan 之前注册路由，否则会被代理 catch-all 覆盖
+    if _settings.monitor_enabled:
+        try:
+            from utils.model_monitor import create_monitor, register_monitor_routes
+            _monitor = create_monitor(_settings, lambda: manager.state in (AuthState.OK, AuthState.SUSPECT))
+            register_monitor_routes(_app, _monitor)
+            manager._monitor = _monitor
+        except Exception as e:
+            logger.error("模型监控初始化失败：%s", e)
 
     return _app
 
