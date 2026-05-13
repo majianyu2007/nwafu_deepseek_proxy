@@ -949,10 +949,19 @@ class AuthSessionManager:
 
         try:
             from utils.fido2_auth import load_credential, build_webauthn_assertion
-            cred = load_credential()
-            if not cred or "keyValue" not in cred or "deviceBindingId" not in cred:
-                return False
-        except Exception:
+        except ImportError:
+            logger.warning("event=fido2_skip reason=import_failed")
+            return False
+
+        cred = load_credential()
+        if not cred:
+            logger.info("event=fido2_skip reason=no_credential_file")
+            return False
+        if "keyValue" not in cred:
+            logger.warning("event=fido2_skip reason=missing_keyValue")
+            return False
+        if "deviceBindingId" not in cred:
+            logger.warning("event=fido2_skip reason=missing_deviceBindingId note=需要 --device-id 参数")
             return False
 
         logger.info("event=fido2_attempt")
@@ -2358,6 +2367,7 @@ _register_proxy_routes(app)
 if __name__ == "__main__":
     api_key_hint = "已配置" if OPENWEBUI_API_KEY else "未配置"
     monitor_hint = "已启用" if settings.monitor_enabled else "未启用"
+    fido2_hint = "已启用" if os.getenv("FIDO2_ENABLED", "").strip().lower() == "true" else "未启用"
     logger.info(
         "\n  NWAFU DeepSeek Proxy (transparent reverse proxy)\n"
         "  ------------------------------------------------\n"
@@ -2366,7 +2376,8 @@ if __name__ == "__main__":
         "  AuthServer: %s\n"
         "  User:       %s\n"
         "  WebUI Key:  %s\n"
-        "  Monitor:    %s\n\n"
+        "  Monitor:    %s\n"
+        "  FIDO2:      %s\n\n"
         "  Note:\n"
         "    - 代理透明转发所有请求到源站\n"
         "    - 客户端 API Key 可使用占位值（代理会注入真实 Open WebUI Key）\n"
@@ -2377,6 +2388,7 @@ if __name__ == "__main__":
         USERNAME,
         api_key_hint,
         monitor_hint,
+        fido2_hint,
         PROXY_PORT,
     )
 
