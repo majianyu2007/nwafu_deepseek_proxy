@@ -942,7 +942,10 @@ class AuthSessionManager:
     async def _try_fido2_login(self, login_page_html: str, login_url: str) -> bool:
         """
         尝试 FIDO2/WebAuthn passkey 登录。成功返回 True。
-        需要 FIDO2_ENABLED=true 且 .data/fido2_credential.json 中存在有效凭据。
+
+        FIDO2 登录分两步：
+        1. 在无 service 的登录页完成 passkey 认证，获取 TGC
+        2. 带着 TGC 访问目标 service，获取 ST ticket
         """
         if os.getenv("FIDO2_ENABLED", "").strip().lower() != "true":
             return False
@@ -967,14 +970,20 @@ class AuthSessionManager:
         logger.info("event=fido2_attempt")
 
         try:
-            # 1. 从 login 页面提取 FIDO execution（与密码表单共用）
-            m = re.search(r'name="execution"[^>]*value="([^"]+)"', login_page_html)
+            # Step 1: 在无 service 的登录页完成 FIDO2 认证获取 TGC
+            # FIDO 表单 action 是 /authserver/login（无 service），
+            # 需要用同一个 context 下的 execution token
+            resp = await self._client.get(
+                f"{AUTH_SERVER}/authserver/login",
+                follow_redirects=False,
+            )
+            m = re.search(r'name="execution"[^>]*value="([^"]+)"', resp.text)
             if not m:
                 logger.warning("event=fido2_error detail=no_execution")
                 return False
             execution = m.group(1)
 
-            # 2. POST /startAssertion
+            # POST /startAssertion
             resp = await self._client.post(
                 f"{AUTH_SERVER}/authserver/startAssertion",
                 json={"userId": base64.b64encode(USERNAME.encode()).decode(),
@@ -989,18 +998,17 @@ class AuthSessionManager:
             req = data["result"]["request"]
             opts = req["publicKeyCredentialRequestOptions"]
 
-            # 3. Build assertion
+            # Build & sign assertion
             assertion = build_webauthn_assertion(
                 cred, opts["challenge"], opts["rpId"], AUTH_SERVER,
             )
-
             response_json = json.dumps(
                 {"requestId": req["requestId"], "credential": assertion, "sessionToken": None},
                 separators=(",", ":"),
             )
             logger.info("event=fido2_assertion_built")
 
-            # 4. Submit FIDO login form (action URL has NO service parameter)
+            # Submit FIDO form (无 service 参数，与表单 action 一致)
             form = {
                 "username": base64.b64encode(USERNAME.encode()).decode(),
                 "responseJson": response_json,
@@ -1022,11 +1030,11 @@ class AuthSessionManager:
                                resp.status_code, err_text or "unknown")
                 return False
 
-            # 5. Follow redirects → collect TGC, get ST for target service
+            # Follow redirects → TGC cookie set
             location = resp.headers.get("location", "")
             await self._follow_cas_redirect(location)
 
-            # 6. Use TGC to access the actual target service
+            # Step 2: 带着 TGC 访问目标 service
             service_url = (
                 f"{TARGET_BASE}/.auth/login/cas/callback"
                 f"?return_to={TARGET_BASE}/"
