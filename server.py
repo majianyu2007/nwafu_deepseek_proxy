@@ -2088,6 +2088,12 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
         try:
             # 启动登录不受频率限制（服务重启是有意操作，不是登录风暴）
             manager._login_attempt_times.clear()
+            # 重启时清除旧熔断，允许一次全新登录尝试
+            if manager.state == AuthState.CIRCUIT_OPEN:
+                manager._state = AuthState.OK
+                manager._consecutive_failures = 0
+                manager._circuit_until = 0
+                logger.info("event=circuit_cleared reason=service_restart")
             manager._save_persisted_state()
             await manager.ensure_login()
             logger.info("初始登录成功")
