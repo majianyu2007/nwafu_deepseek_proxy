@@ -8,11 +8,12 @@
 
 - `http://localhost:8000/` 直接就是 Open WebUI，走代理认证过的会话。
 - `http://localhost:8000/v1` 作为 OpenAI API Base，兼容各种第三方客户端。
-- 客户端的 API Key 随便填，代理会自动注入 `.env` 里配置的真实 Key。
+- 客户端 API Key 任意占位值即可，代理会自动注入 `.env` 中配置的真实 Key。
 - 自动完成 CAS 登录、TOTP 二次验证、ST ticket 兑换、Cookie 保活。
-- 支持 passkey (FIDO2/WebAuthn) 登录，遇到滑块验证码也能过。
-- 登录后的 Cookie 持久化到 `.data/cookies.json`，重启自动恢复，不用每次重登。
-- 登录保护机制：频率限制、单飞锁、指数退避、熔断器，防止请求风暴把账号搞封。
+- 支持 passkey (FIDO2/WebAuthn) 登录，可绕过滑块验证码。
+- 登录后的 Cookie 持久化到 `.data/cookies.json`，重启时自动恢复，避免每次重启重登。
+- 内置登录保护：频率限制、单飞锁、指数退避、熔断器，防止账号因频繁登录被冻结。
+- 支持用户通过 `/totp` 页面手动输入 TOTP 码（不依赖自动二次验证）。
 - 可选模型变更监控，Telegram / Webhook / SSE 通知，带 `/monitor` 面板。
 
 ## 快速开始
@@ -79,7 +80,7 @@ Chatbox、LobeChat、NextChat、Cherry Studio 都试过能用。
 https://deepseek.nwafu.edu.cn
 ```
 
-登录时会走一遍金智 CAS 标准流程：拉登录页 → 提取 execution 和 salt → AES 加密密码 → 提交表单 → 跟 CAS 重定向链 → 如果有二次验证就切 TOTP → 收集目标站 Cookie → 完事。
+登录流程为金智 CAS 标准步骤：获取登录页 → 提取 execution 和 salt → AES 加密密码 → 提交表单 → 跟随 CAS 重定向链 → 若触发二次验证则完成 TOTP → 收集目标站 Cookie。
 
 ## 登录方式
 
@@ -120,11 +121,11 @@ https://deepseek.nwafu.edu.cn
 
 密码或 passkey 登录成功后，CAS 会话 Cookie 自动保存到 `.data/cookies.json`。重启时先试恢复，有效就零次登录，无效才走完整登录。
 
-Docker 每天重启也没事，搭配 CAS 的 `rememberMe`（7天免登录），一天顶多登一次。
+Docker 每天重启也没有额外开销，搭配 CAS 的 `rememberMe`（7天免登录），每天最多登录一次。
 
-如果你在其他设备已经登过了，可以手动把 Cookie 塞进来：
+如果已在其他设备的浏览器上登录过，可以将 Cookie 导出到本机使用：
 
-1. 浏览器 F12 → Application → Cookies → 分别选 `authserver.nwafu.edu.cn` 和 `deepseek.nwafu.edu.cn` → 把 Cookie 内容抄下来。
+1. 浏览器 F12 → Application → Cookies → 分别选择 `authserver.nwafu.edu.cn` 和 `deepseek.nwafu.edu.cn` → 逐个记录 Name、Value、Domain、Path。
 2. 创建 `.data/cookies.json`：
 
 ```json
@@ -141,18 +142,32 @@ Docker 每天重启也没事，搭配 CAS 的 `rememberMe`（7天免登录），
 
 ## TOTP 二次验证
 
-NWAFU 从 2026-05-12 开始强制二次验证。配置 TOTP 密钥后代理自动搞定。
+NWAFU 从 2026-05-12 开始强制二次验证。代理支持两种方式。
 
-打开你的认证器 APP（Google、Microsoft、Authy 等），找到 NWAFU 的条目，导出密钥（32 位 Base32），填到 `.env`：
+### 自动模式
+
+配置 TOTP 密钥，代理自动生成一次性密码完成验证。
+
+打开认证器 APP（Google、Microsoft、Authy 等），找到 NWAFU 的条目，导出密钥（32 位 Base32），填入 `.env`：
 
 ```env
 TOTP_SECRET=你的Base32密钥
 TOTP_AUTO_ENABLED=true
 ```
 
-`TOTP_SECRET` 没配的话，代理遇到二次验证会报错退避，不会影响手动登录。
+密钥格式支持纯 Base32、`otpauth://` URL、含空格字符串（自动清洗）。
 
-`TOTP_AUTO_ENABLED=false` 可以让代理就算有密钥也不自动填——碰到二次验证进退避等你自己处理。
+### 手动模式
+
+不配 `TOTP_SECRET`，或将 `TOTP_AUTO_ENABLED` 设为 `false`。代理检测到二次验证时会暂停等待，日志提示：
+
+```
+请在浏览器访问 http://localhost:8000/totp 输入TOTP码
+```
+
+打开浏览器访问 `/totp`，页面上有输入框和当前 TOTP 窗口的倒计时。输入认证器 APP 里显示的 6 位数字，提交即可。代理收到后继续完成登录。
+
+等待超时时间为 5 分钟，超过未提交则退避重试。
 
 ## 账号保护
 
@@ -164,7 +179,7 @@ TOTP_AUTO_ENABLED=true
 - **频率限制**：每小时最多 6 次登录，状态存到 `.data/login_state.json`。
 - **指数退避**：登录失败后等 5s → 20s → 80s → 5min → 15min。
 - **熔断器**：连续失败 3 次开熔断，根据失败类型 15min ~ 6h 不等。
-- **验证码保护**：碰到滑块验证码直接 2 小时熔断，不会循环重试把自己搞冻结。
+- **验证码保护**：检测到滑块验证码后进入 2 小时熔断，不反复重试导致账号冻结。
 
 ## 模型监控
 
@@ -182,7 +197,7 @@ WEBHOOK_URLS=
 
 ## 常见问题
 
-**遇到滑块验证码怎么办**
+**登录时触发滑块验证码**
 
 代理检测到验证码后会进 2 小时熔断，不会反复重试。
 
