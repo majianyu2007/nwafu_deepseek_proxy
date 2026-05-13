@@ -327,7 +327,7 @@ class ModelMonitor:
             self._last_poll_time = time.time()
             self._last_poll_ok = False
             self._poll_error = str(e)
-            logger.error("event=monitor_poll_error error=%s", e)
+            logger.warning("event=monitor_poll_error error=%s", e)
             return None
 
         if not self._initialized:
@@ -382,6 +382,7 @@ class ModelMonitor:
 
         async def _loop():
             logger.info("模型监控启动（轮询间隔 %ds）", self.poll_interval)
+            await asyncio.sleep(5)  # 等待代理就绪，避免首次轮询因网络未就绪误报
             await self.poll_once()
             while True:
                 await asyncio.sleep(self.poll_interval)
