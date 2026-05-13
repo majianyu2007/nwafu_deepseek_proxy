@@ -2128,7 +2128,7 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
         if _settings.monitor_enabled:
             try:
                 from utils.model_monitor import create_monitor, register_monitor_routes
-                monitor = create_monitor(_settings, lambda: manager.state == AuthState.OK)
+                monitor = create_monitor(_settings, lambda: manager.state in (AuthState.OK, AuthState.SUSPECT))
                 register_monitor_routes(_app, monitor)
                 await monitor.start()
                 logger.info("模型监控已启用（间隔 %ds）", _settings.monitor_poll_interval)
@@ -2228,6 +2228,16 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
             return HTMLResponse("<html><head><meta charset='utf-8'></head><body><h3>TOTP 已提交</h3><p>代理正在继续登录，请稍候。</p></body></html>")
         return HTMLResponse("<html><body><h3>提交失败</h3><p>请重试。</p></body></html>")
 
+    async def _health_trigger_relogin():
+        """Fire-and-forget: health 端点检测到 CAS 重定向时主动触发重登。"""
+        try:
+            logger.info("event=health_trigger_relogin")
+            await session_mgr.force_relogin()
+        except (CircuitOpenError, UpstreamUnavailableError, CriticalLoginError):
+            pass
+        except Exception as e:
+            logger.error("event=health_trigger_relogin error=%s", e)
+
     @_app.get("/health")
     async def health(response: Response):
         """健康检查：报告认证状态、上游可达性和会话有效性。
@@ -2276,9 +2286,9 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
         recent_failures = [t for t in manager._login_attempt_times if t > now - LOGIN_WINDOW_SECONDS]
         result["login_attempts_last_hour"] = len(recent_failures)
 
-        # 会话验证：若状态 OK 且有 client，做一次实际探测
+        # 会话验证：若 client 存在，始终做实际探测（含 SUSPECT 状态）
         client = manager._client
-        if state == AuthState.OK and client is not None:
+        if client is not None:
             t0 = time.monotonic()
             try:
                 headers = {"Host": TARGET_HOST}
@@ -2299,6 +2309,8 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
                         result["note"] = "会话已过期，需要重新登录"
                         result["latency_ms"] = latency_ms
                         response.status_code = 503
+                        # 后台触发重登，不等 keepalive 周期
+                        asyncio.create_task(_health_trigger_relogin())
                         return result
 
                 result["status"] = "healthy"
@@ -2311,11 +2323,6 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
                 result["note"] = f"上游探测失败: {type(e).__name__}"
                 result["latency_ms"] = int((time.monotonic() - t0) * 1000)
                 return result
-
-        if state == AuthState.SUSPECT:
-            result["status"] = "degraded"
-            result["note"] = "认证状态异常，正在等待恢复"
-            return result
 
         if state == AuthState.EXPIRED:
             result["status"] = "degraded"
