@@ -1,30 +1,27 @@
 # nwafu_deepseek_proxy
 
-西北农林科技大学 Open WebUI 本地透明反向代理。代理在本机完成金智教育（Wisedu）CAS 认证，维护上游会话 Cookie，并把浏览器或第三方客户端的请求转发到 `deepseek.nwafu.edu.cn`。
+西北农林科技大学 Open WebUI 透明反向代理。在本机完成金智教育（Wisedu）CAS 认证，维护上游会话 Cookie，所有请求转发到 `deepseek.nwafu.edu.cn`。
 
-> 当前 `main` 分支是 Python/FastAPI 实现。Rust 重写版在 `rust-rewrite` 分支。
+`main` 分支是 Python/FastAPI 实现，`rust-rewrite` 分支是 Rust/Axum 重写版。
 
-## 功能
+## 它能做什么
 
-- 访问 `http://localhost:8000/` 可直接使用完整 Open WebUI。
-- OpenAI 兼容客户端使用 `http://localhost:8000/v1` 作为 API Base。
-- 客户端 API Key 可填写占位值，代理会注入真实 Open WebUI API Key。
-- 自动完成 CAS 登录（含二次验证 TOTP）、ST ticket 兑换、Cookie 保活和过期刷新。
-- 内置登录频率限制、指数退避、熔断和单飞锁，避免上游异常导致账号频繁登录。
-- 可选模型变更监控，支持 Telegram、Webhook、SSE 和 `/monitor` 面板。
+- `http://localhost:8000/` 直接就是 Open WebUI，走代理认证过的会话。
+- `http://localhost:8000/v1` 作为 OpenAI API Base，兼容各种第三方客户端。
+- 客户端的 API Key 随便填，代理会自动注入 `.env` 里配置的真实 Key。
+- 自动完成 CAS 登录、TOTP 二次验证、ST ticket 兑换、Cookie 保活。
+- 支持 passkey (FIDO2/WebAuthn) 登录，遇到滑块验证码也能过。
+- 登录后的 Cookie 持久化到 `.data/cookies.json`，重启自动恢复，不用每次重登。
+- 登录保护机制：频率限制、单飞锁、指数退避、熔断器，防止请求风暴把账号搞封。
+- 可选模型变更监控，Telegram / Webhook / SSE 通知，带 `/monitor` 面板。
 
 ## 快速开始
 
-### 1. 准备环境
+### 1. 环境
 
-需要 Python 3.9+，并且运行环境可以访问：
+Python 3.9+，能访问 `authserver.nwafu.edu.cn` 和 `deepseek.nwafu.edu.cn`（校园网或 VPN）。
 
-- `authserver.nwafu.edu.cn`
-- `deepseek.nwafu.edu.cn`
-
-通常需要校园网或 VPN。
-
-### 2. 安装依赖
+### 2. 安装
 
 ```bash
 git clone https://github.com/majianyu2007/nwafu_deepseek_proxy.git
@@ -41,199 +38,175 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-编辑 `.env`，至少填写：
+最少填三项：
 
-| 变量 | 必填 | 说明 |
-| --- | --- | --- |
-| `NWAFU_USERNAME` | 是 | 统一身份认证学号 |
-| `NWAFU_PASSWORD` | 是 | 统一身份认证密码，包含 `#` 时请用引号包裹 |
-| `OPENWEBUI_API_KEY` | 是 | Open WebUI「个人设置 / 账号 / API 密钥」中生成 |
-| `PROXY_PORT` | 否 | 本地监听端口，默认 `8000` |
-| `TARGET_HOST` | 否 | 上游 Open WebUI 域名，默认 `deepseek.nwafu.edu.cn` |
-| `AUTH_SERVER` | 否 | CAS 服务地址，默认 `https://authserver.nwafu.edu.cn` |
-| `TOTP_SECRET` | 否 | TOTP 安全令牌密钥（Base32），用于自动完成二次验证 |
+| 变量 | 说明 |
+|------|------|
+| `NWAFU_USERNAME` | 学号 |
+| `NWAFU_PASSWORD` | CAS 密码，包含 `#` 等特殊字符用引号包起来 |
+| `OPENWEBUI_API_KEY` | Open WebUI → 个人设置 → 账号 → API 密钥 |
+
+其他可选变量见 `.env.example` 里的注释。
 
 ### 4. 启动
 
 ```bash
 python server.py
+# 或者 docker compose up -d
 ```
 
-启动后：
-
-- Web UI: `http://localhost:8000/`
-- OpenAI API Base: `http://localhost:8000/v1`
-- Health check: `http://localhost:8000/health`
-
-## Docker
-
-```bash
-cp .env.example .env
-# 编辑 .env
-docker compose up -d
-```
-
-停止：
-
-```bash
-docker compose down
-```
-
-## 验证
-
-列出模型：
-
-```bash
-python utils/list_models.py
-```
-
-发送测试对话：
-
-```bash
-python utils/test_api.py
-python utils/test_api.py Qwen3-235B-A22B
-```
-
-也可以直接用 curl：
-
-```bash
-curl http://localhost:8000/v1/models \
-  -H 'Authorization: Bearer sk-local'
-```
+然后访问 `http://localhost:8000`。
 
 ## 客户端配置
 
-任何支持自定义 OpenAI API Base 的客户端都可以使用：
+API 支持 OpenAI 兼容协议，什么客户端都行：
 
-| 配置项 | 值 |
-| --- | --- |
-| API Base | `http://localhost:8000/v1` |
-| API Key | 任意占位值，例如 `sk-local` |
+- API Base: `http://localhost:8000/v1`
+- API Key: 任意占位值，比如 `sk-local`
 
-常见客户端：
-
-- Chatbox
-- LobeChat
-- NextChat
-- Cherry Studio
-
-## 代理范围
-
-代理透明转发所有路径，不限于：
-
-| 路径 | 说明 |
-| --- | --- |
-| `/` | Open WebUI 页面 |
-| `/v1/models` | OpenAI 兼容模型列表 |
-| `/v1/chat/completions` | OpenAI 兼容对话补全，支持流式响应 |
-| `/api/*` | Open WebUI 内部 API |
-| `/ws/*` | WebSocket |
-| 其它路径 | 由上游决定 |
+Chatbox、LobeChat、NextChat、Cherry Studio 都试过能用。
 
 ## 工作原理
 
-```text
-浏览器 / 第三方客户端
-        |
-        |  http://localhost:8000/*
-        v
-本地 FastAPI 代理
-        |
-        |  注入 CAS Cookie
-        |  注入 Authorization: Bearer <OPENWEBUI_API_KEY>
-        |  重写 Origin / Referer / Location
-        v
+```
+浏览器 / 客户端
+       │ http://localhost:8000/*
+       ▼
+  FastAPI 代理
+       │ 注入 CAS Cookie + API Key
+       │ 重写 Origin / Referer / Location
+       ▼
 https://deepseek.nwafu.edu.cn
 ```
 
-CAS 登录流程：
+登录时会走一遍金智 CAS 标准流程：拉登录页 → 提取 execution 和 salt → AES 加密密码 → 提交表单 → 跟 CAS 重定向链 → 如果有二次验证就切 TOTP → 收集目标站 Cookie → 完事。
 
-1. 获取 AuthServer 登录页，提取 `execution` 和 `pwdEncryptSalt`。
-2. 使用 AES-CBC + PKCS7 按前端逻辑加密密码。
-3. 提交登录表单。
-4. 跟随 AuthServer 到 Open WebUI CAS callback 的重定向链。
-5. **（新增）检测二次验证跳转**：若重定向到 `reAuthLoginView.do?isMultifactor=true`，自动切换至安全令牌 (TOTP) 并提交验证码。
-6. 收集目标站会话 Cookie，用于后续代理请求。
+## 登录方式
+
+代理支持三种登录方式，优先级从高到低：
+
+### Passkey 登录 (FIDO2/WebAuthn)
+
+这个方案能绕过密码和滑块验证码。原理是用你 Bitwarden 里存的 ECDSA 私钥，等价模拟浏览器 `navigator.credentials.get()` 的签名流程。
+
+**前提**：你在 CAS 个人中心开过生物识别，Bitwarden 里有对应的 passkey 条目。
+
+**步骤**：
+
+1. 先从浏览器取设备绑定 ID。在绑定过生物识别的浏览器里打开 CAS 登录页，F12 Console 跑：
+   ```
+   localStorage.getItem('anonbiometricsd')
+   ```
+   记下输出的值。
+
+2. Bitwarden → 设置 → 导出密码库 → JSON（未加密）。
+
+3. 执行提取脚本：
+   ```bash
+   python utils/extract_fido2.py bitwarden_export.json --name <你的Bitwarden条目名> --save --device-id <第1步取到的ID>
+   ```
+   这一步生成 `.data/fido2_credential.json`，里面有私钥、凭据ID、设备绑定ID。
+
+4. `.env` 里加一行：
+   ```env
+   FIDO2_ENABLED=true
+   ```
+
+5. 重启代理。之后每次登录优先走 passkey，失败了再回退密码。
+
+注意：如果你的 passkey 不在 Bitwarden 而在其他管理器，只要能把 ECDSA P-256 私钥导出来，手动写 `.data/fido2_credential.json` 也能用——格式参考 `utils/extract_fido2.py` 的输出。
+
+### Cookie 持久化
+
+密码或 passkey 登录成功后，CAS 会话 Cookie 自动保存到 `.data/cookies.json`。重启时先试恢复，有效就零次登录，无效才走完整登录。
+
+Docker 每天重启也没事，搭配 CAS 的 `rememberMe`（7天免登录），一天顶多登一次。
+
+如果你在其他设备已经登过了，可以手动把 Cookie 塞进来：
+
+1. 浏览器 F12 → Application → Cookies → 分别选 `authserver.nwafu.edu.cn` 和 `deepseek.nwafu.edu.cn` → 把 Cookie 内容抄下来。
+2. 创建 `.data/cookies.json`：
+
+```json
+[
+  {"name": "CASTGC", "value": "TGT-xxx...", "domain": "authserver.nwafu.edu.cn", "path": "/"}
+]
+```
+
+字段名大小写无所谓，`domain`/`Domain` 都行。至少需要一个 `authserver.nwafu.edu.cn` 下的 `CASTGC`，其他 cookie 代理自己会补。
+
+### 密码登录（兜底）
+
+上面的都失败就走密码登录，该怎么做怎么做。
+
+## TOTP 二次验证
+
+NWAFU 从 2026-05-12 开始强制二次验证。配置 TOTP 密钥后代理自动搞定。
+
+打开你的认证器 APP（Google、Microsoft、Authy 等），找到 NWAFU 的条目，导出密钥（32 位 Base32），填到 `.env`：
+
+```env
+TOTP_SECRET=你的Base32密钥
+TOTP_AUTO_ENABLED=true
+```
+
+`TOTP_SECRET` 没配的话，代理遇到二次验证会报错退避，不会影响手动登录。
+
+`TOTP_AUTO_ENABLED=false` 可以让代理就算有密钥也不自动填——碰到二次验证进退避等你自己处理。
 
 ## 账号保护
 
-代理将认证失效与上游异常分开处理，只有明确的 CAS 登录重定向才会触发重新登录。
+代理会区分"上游挂了"和"认证过期"，不会把一次网络错误当成需要重登。只有真的 CAS 登录重定向才会触发重新登录，其他情况标记为可疑等下次再看。
 
-| 机制 | 说明 |
-| --- | --- |
-| 状态机 | 区分 `OK`、`SUSPECT`、`EXPIRED`、`LOGIN_BACKOFF`、`CIRCUIT_OPEN` |
-| 单飞锁 | 并发请求最多触发一次真实 CAS 登录 |
-| 频率限制 | 每小时最多 6 次登录尝试，状态持久化到 `.data/login_state.json` |
-| 最小间隔 | 两次登录之间不少于 60s 冷却 |
-| force_relogin 限流 | 10s 内重复 force_relogin 请求被忽略 |
-| 指数退避 | 登录失败后逐步延长重试间隔 |
-| 熔断器 | 连续失败后暂停登录，保护账号 |
-| 失败分类 | 账号锁定、验证码、密码错误等高风险错误使用更长熔断 |
-| 会话验证 | 登录成功后立即 HEAD 目标站验证会话有效性 |
+几个关键防护：
 
-## 二次验证 (TOTP)
+- **单飞锁**：多个并发请求进来，只有第一个触发真实登录，其他的等着。
+- **频率限制**：每小时最多 6 次登录，状态存到 `.data/login_state.json`。
+- **指数退避**：登录失败后等 5s → 20s → 80s → 5min → 15min。
+- **熔断器**：连续失败 3 次开熔断，根据失败类型 15min ~ 6h 不等。
+- **验证码保护**：碰到滑块验证码直接 2 小时熔断，不会循环重试把自己搞冻结。
 
-自 2026-05-12 起，NWAFU 统一身份认证系统启用二次验证。代理支持通过 TOTP 安全令牌自动完成二次验证。
+## 模型监控
 
-### 获取 TOTP 密钥
-
-1. 打开你绑定安全令牌时使用的认证器 APP（Google Authenticator / Microsoft Authenticator / Authy 等）。
-2. 找到 NWAFU 统一身份认证的账户条目，选择「查看详情」或「导出」。
-3. 复制密钥（32 位 Base32 编码的字符串，如 `JBSWY3DPEHPK3PXP`）。
-
-### 配置
-
-```env
-TOTP_SECRET=你的base32密钥
-```
-
-支持多种格式：纯 Base32、`otpauth://` URL、含空格字符串（自动清洗）。
-
-未配置 `TOTP_SECRET` 时，代理会在需要二次验证时正常报错并进入退避流程，不会影响单次人工登录。
-
-## 模型变更监控
-
-可选启用：
+可选。`.env` 里：
 
 ```env
 MONITOR_ENABLED=true
 MONITOR_POLL_INTERVAL=600
-```
-
-通知配置：
-
-```env
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 WEBHOOK_URLS=
-WEBHOOK_SECRET=
-NOTIFY_PROXY=
 ```
 
-启用后可访问 `http://localhost:8000/monitor` 查看监控面板。监控只在认证状态正常时轮询，不会主动触发 CAS 登录。
-
-## 分支
-
-- `main`: Python/FastAPI 实现，功能完整，包含模型监控。
-- `rust-rewrite`: Rust/Axum 重写版，包含 GitHub Actions Release 二进制构建。
+开了之后定期拉模型列表，检测到变化就通知你。`/monitor` 有面板看状态。监控只在认证正常时才拉，不会触发登录。
 
 ## 常见问题
 
-**启动时报密码错误或账户不存在**
+**遇到滑块验证码怎么办**
 
-检查 `.env` 中的 `NWAFU_USERNAME`、`NWAFU_PASSWORD`。密码包含 `#` 等特殊字符时需要加引号。
+代理检测到验证码后会进 2 小时熔断，不会反复重试。
 
-**模型请求返回 401**
+1. 浏览器打开 `https://deepseek.nwafu.edu.cn`，手动过一遍验证码。
+2. 代理熔断到了自动重试（此时 Cookie 已经有效，直接能用）。
+3. 不想等可以手动导出浏览器 Cookie 到 `.data/cookies.json` 然后重启。
 
-检查 `OPENWEBUI_API_KEY` 是否有效。浏览器或客户端传入的 API Key 会被代理替换，不代表上游真实 Key。
+收到学校冻结短信的话，按短信里说的解冻时间等，别反复重启。
+
+**启动报「密码错误或账户不存在」**
+
+`.env` 里 `NWAFU_USERNAME` / `NWAFU_PASSWORD` 对不对，密码有 `#` 的话加引号。
+
+**请求返回 401**
+
+`OPENWEBUI_API_KEY` 可能过期了。去 Open WebUI 重新生成一个。
 
 **Model not found**
 
-运行 `python utils/list_models.py` 查看实际上游模型 ID。
+跑 `python utils/list_models.py` 看上游实际有哪些模型，名字可能和预想的不同。
 
-**浏览器出现 HTTPS localhost 相关错误**
+**localhost HTTPS 报错**
 
-清理 `localhost` 站点数据，或改用 `http://127.0.0.1:8000` 访问一次。
+清掉 `localhost` 的浏览器站点数据，或者换 `http://127.0.0.1:8000`。
 
 ## License
 

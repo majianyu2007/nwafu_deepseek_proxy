@@ -22,3 +22,7 @@ target/
 *.swo
 *~
 .DS_Store
+
+# 临时文件（Bitwarden 导出、录制数据，含敏感信息）
+bitwarden_export_*.json
+cas-recording-*.json

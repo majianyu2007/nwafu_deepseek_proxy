@@ -47,6 +47,7 @@ request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".data")
 _PERSIST_FILE = os.path.join(_DATA_DIR, "login_state.json")
+_COOKIE_FILE = os.path.join(_DATA_DIR, "cookies.json")
 
 
 class _RequestIDFilter(logging.Filter):
@@ -74,7 +75,7 @@ for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 
 # ---- 时间常量 ----
 
-COOKIE_TTL_SECONDS = 25 * 60
+COOKIE_TTL_SECONDS = 120 * 60  # CAS rememberMe 开启后 TGC 存活 7 天，本地 TTL 设 2h 足够
 KEEPALIVE_INTERVAL_SECONDS = 5 * 60
 KEEPALIVE_JITTER_SECONDS = 30
 MAX_LOGIN_REDIRECTS = 10
@@ -443,6 +444,110 @@ class AuthSessionManager:
         except Exception as e:
             logger.warning("event=persist_failed error=%s", e)
 
+    # ---- Cookie 持久化 ----
+
+    def _save_cookies(self):
+        """登录成功后将 CAS 会话 Cookie 序列化到文件，支持重启后恢复"""
+        if not self._client:
+            return
+        try:
+            cookies = []
+            for cookie in self._client.cookies.jar:
+                cookies.append({
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain,
+                    "path": cookie.path,
+                })
+            os.makedirs(_DATA_DIR, exist_ok=True)
+            with open(_COOKIE_FILE, "w") as f:
+                json.dump({"cookies": cookies, "saved_at": time.time()}, f)
+            logger.info("event=cookies_saved count=%d", len(cookies))
+        except Exception as e:
+            logger.warning("event=cookies_save_error error=%s", e)
+
+    async def _restore_session(self) -> bool:
+        """从文件恢复 Cookie 并快速验证是否仍然有效。成功返回 True 并设置 OK 状态。
+
+        支持两种 JSON 格式：
+        1. 代理自动导出的格式：{"cookies": [...], "saved_at": 1234567890}
+        2. 浏览器导出的纯数组格式：[{"name": "TGC", "value": "...", "domain": "..."}, ...]
+        兼容常见 cookie 字段名的大小写差异（domain/Domain, path/Path）。
+        """
+        try:
+            with open(_COOKIE_FILE, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return False
+
+        # 兼容两种格式：{"cookies": [...]} 或 [...]
+        if isinstance(data, list):
+            cookies = data
+            saved_at = 0
+        elif isinstance(data, dict):
+            cookies = data.get("cookies", [])
+            saved_at = data.get("saved_at", 0)
+        else:
+            return False
+
+        if not cookies:
+            return False
+
+        # 统一 cookie 字段名（兼容 Domain/domain, Path/path 等大小写差异）
+        normalized = []
+        for c in cookies:
+            normalized.append({
+                "name": c.get("name", ""),
+                "value": c.get("value", ""),
+                "domain": c.get("domain", c.get("Domain", "")),
+                "path": c.get("path", c.get("Path", "/")),
+            })
+
+        age_hint = ""
+        if saved_at:
+            age_days = (time.time() - saved_at) / 86400
+            age_hint = f" saved_ago={age_days:.1f}d"
+
+        if self._client:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+        self._client = await self._create_client()
+        for c in normalized:
+            self._client.cookies.set(c["name"], c["value"], c["domain"], c["path"])
+        logger.info("event=cookie_restore count=%d%s", len(normalized), age_hint)
+
+        try:
+            headers = {"Host": TARGET_HOST}
+            if OPENWEBUI_API_KEY:
+                headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+            resp = await self._client.head(
+                f"{TARGET_BASE}/api/config",
+                headers=headers,
+                follow_redirects=False,
+            )
+            if resp.status_code in (301, 302, 307):
+                location = resp.headers.get("location", "")
+                if _is_cas_login_url(location):
+                    logger.info("event=cookie_restore result=session_expired")
+                    await self._client.aclose()
+                    self._client = None
+                    return False
+            logger.info("event=cookie_restore result=valid status=%d", resp.status_code)
+            self._last_login_time = time.monotonic()
+            self._last_login_ok_time = time.monotonic()
+            self._state = AuthState.OK
+            if self._state == AuthState.CIRCUIT_OPEN:
+                self._transition(AuthState.OK, "cookie_restore:override_circuit")
+            self._save_persisted_state()
+            return True
+        except Exception as e:
+            logger.warning("event=cookie_restore result=validation_error error=%s", e)
+            await self._client.aclose()
+            self._client = None
+            return False
+
     # ---- 状态管理 ----
 
     @property
@@ -571,6 +676,14 @@ class AuthSessionManager:
         """
         now = time.monotonic()
 
+        # 尝试从持久化 Cookie 恢复会话（仅首次，client 为空时）
+        if self._client is None:
+            try:
+                if await self._restore_session():
+                    return self._client
+            except Exception as e:
+                logger.warning("event=cookie_restore exception=%s", e)
+
         # 快速路径：无锁检查
         if self._state == AuthState.OK and self._client is not None and (now - self._last_login_time) <= self._cookie_ttl:
             return self._client
@@ -667,6 +780,7 @@ class AuthSessionManager:
             self._login_then_rejected = False
             logger.info("event=login_result outcome=success")
             self._save_persisted_state()
+            self._save_cookies()
             return self._client  # type: ignore[return-value]
         except TwoFactorError as e:
             self._consecutive_failures += 1
@@ -726,7 +840,7 @@ class AuthSessionManager:
         self._last_login_time = 0
         try:
             return await self.ensure_login()
-        except (CircuitOpenError, UpstreamUnavailableError):
+        except (CircuitOpenError, UpstreamUnavailableError, CriticalLoginError):
             raise
         except Exception as e:
             logger.error("event=force_relogin failed: %s", e)
@@ -820,8 +934,110 @@ class AuthSessionManager:
 
         return ("AuthServer 登录失败: 未知错误", "unknown", CIRCUIT_NORMAL_DURATION)
 
+    async def _try_fido2_login(self, login_page_html: str, login_url: str) -> bool:
+        """
+        尝试 FIDO2/WebAuthn passkey 登录。成功返回 True。
+        需要 FIDO2_ENABLED=true 且 .data/fido2_credential.json 中存在有效凭据。
+        """
+        if os.getenv("FIDO2_ENABLED", "").strip().lower() != "true":
+            return False
+
+        try:
+            from utils.fido2_auth import load_credential, build_webauthn_assertion
+            cred = load_credential()
+            if not cred or "keyValue" not in cred or "deviceBindingId" not in cred:
+                return False
+        except Exception:
+            return False
+
+        logger.info("event=fido2_attempt")
+
+        try:
+            # 1. 从 login 页面提取 FIDO execution（与密码表单共用）
+            m = re.search(r'name="execution"[^>]*value="([^"]+)"', login_page_html)
+            if not m:
+                logger.warning("event=fido2_error detail=no_execution")
+                return False
+            execution = m.group(1)
+
+            # 2. POST /startAssertion
+            resp = await self._client.post(
+                f"{AUTH_SERVER}/authserver/startAssertion",
+                json={"userId": base64.b64encode(USERNAME.encode()).decode(),
+                      "id": cred["deviceBindingId"]},
+                headers={"Content-Type": "application/json;charset=utf-8"},
+            )
+            data = resp.json()
+            if not data.get("result", {}).get("success"):
+                logger.warning("event=fido2_start_assertion_failed response=%s", data)
+                return False
+
+            req = data["result"]["request"]
+            opts = req["publicKeyCredentialRequestOptions"]
+
+            # 3. Build assertion
+            assertion = build_webauthn_assertion(
+                cred, opts["challenge"], opts["rpId"], AUTH_SERVER,
+            )
+
+            response_json = json.dumps(
+                {"requestId": req["requestId"], "credential": assertion, "sessionToken": None},
+                separators=(",", ":"),
+            )
+            logger.info("event=fido2_assertion_built")
+
+            # 4. Submit FIDO login form (action URL has NO service parameter)
+            form = {
+                "username": base64.b64encode(USERNAME.encode()).decode(),
+                "responseJson": response_json,
+                "_eventId": "submit",
+                "cllt": "fidoLogin",
+                "dllt": "generalLogin",
+                "lt": "",
+                "execution": execution,
+            }
+            resp = await self._client.post(
+                f"{AUTH_SERVER}/authserver/login",
+                data=form,
+            )
+            logger.info("event=fido2_form_submit status=%d", resp.status_code)
+
+            if resp.status_code not in (301, 302, 307, 308):
+                err_text = _extract_error_text(resp.text)
+                logger.warning("event=fido2_login_failed status=%d error=%s",
+                               resp.status_code, err_text or "unknown")
+                return False
+
+            # 5. Follow redirects → collect TGC, get ST for target service
+            location = resp.headers.get("location", "")
+            await self._follow_cas_redirect(location)
+
+            # 6. Use TGC to access the actual target service
+            service_url = (
+                f"{TARGET_BASE}/.auth/login/cas/callback"
+                f"?return_to={TARGET_BASE}/"
+            )
+            encoded_service = quote(service_url, safe="")
+            resp = await self._client.get(
+                f"{AUTH_SERVER}/authserver/login?service={encoded_service}",
+                follow_redirects=False,
+            )
+            if resp.status_code in (301, 302, 307, 308):
+                location = resp.headers.get("location", "")
+                await self._handle_login_redirect(location)
+            else:
+                logger.warning("event=fido2_service_redirect status=%d", resp.status_code)
+                return False
+
+            logger.info("event=fido2_login_success")
+            return True
+
+        except Exception as e:
+            logger.warning("event=fido2_login_error error=%s", e)
+            return False
+
     async def _do_login(self):
-        """执行完整的金智 AuthServer 登录流程"""
+        """执行完整的金智 AuthServer 登录流程。优先尝试 FIDO2 passkey 登录。"""
         logger.info("event=login_start target=%s", TARGET_BASE)
 
         if self._client:
@@ -853,15 +1069,22 @@ class AuthSessionManager:
 
             logger.info("解析表单参数成功：salt=%s**** execution=%s...", salt[:4], execution[:20])
 
-            # Step 2: 加密密码
+            # Step 2: 尝试 FIDO2 passkey 登录（优先级高于密码登录）
+            try:
+                if await self._try_fido2_login(resp.text, login_url):
+                    return
+            except Exception as e:
+                logger.warning("event=fido2_login_fallback reason=%s", e)
+
+            # Step 3: 加密密码
             encrypted_pwd = encrypt_password(PASSWORD, salt)
 
-            # Step 3: 提交登录表单
+            # Step 4: 提交登录表单
             login_data = {
                 "username": USERNAME,
                 "password": encrypted_pwd,
                 "captcha": "",
-                "rememberMe": "false",
+                "rememberMe": "true",
                 "_eventId": "submit",
                 "cllt": "userNameLogin",
                 "lt": "",
@@ -990,6 +1213,11 @@ class AuthSessionManager:
                 "检测到二次验证要求，但未配置 TOTP_SECRET。"
                 "请从认证器 APP 中获取 TOTP 密钥并填入 .env 文件"
             )
+        if os.getenv("TOTP_AUTO_ENABLED", "true").strip().lower() != "true":
+            raise RuntimeError(
+                "检测到二次验证要求，TOTP_AUTO_ENABLED=false，"
+                "请手动完成二次验证后重启代理"
+            )
         # 兼容多种 secret 格式：纯 base32、otpauth:// URL、含空格的
         secret = TOTP_SECRET.strip()
         if secret.startswith("otpauth://"):
@@ -1110,7 +1338,7 @@ class AuthSessionManager:
                     self._transition(AuthState.EXPIRED, "keepalive:definitive_cas_redirect")
                     try:
                         await self.ensure_login()
-                    except (CircuitOpenError, UpstreamUnavailableError):
+                    except (CircuitOpenError, UpstreamUnavailableError, CriticalLoginError):
                         pass
                     return
 
@@ -1126,7 +1354,9 @@ class AuthSessionManager:
 
         except Exception as e:
             logger.warning("event=keepalive result=network_error error=%s", e)
-            self._transition(AuthState.SUSPECT, "keepalive:network_error")
+            # 如果已经进入熔断或退避状态，不要覆盖（避免 keepalive 把 CIRCUIT_OPEN → SUSPECT 导致重试死循环）
+            if self._state not in (AuthState.CIRCUIT_OPEN, AuthState.LOGIN_BACKOFF):
+                self._transition(AuthState.SUSPECT, "keepalive:network_error")
 
     async def start_keepalive(self):
         async def _keepalive_loop():
@@ -1544,7 +1774,7 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
                     logger.warning("event=proxy_auth_expired path=%s attempt=%d", target_path, attempt + 1)
                     try:
                         await session_mgr.force_relogin()
-                    except (CircuitOpenError, UpstreamUnavailableError):
+                    except (CircuitOpenError, UpstreamUnavailableError, CriticalLoginError):
                         pass
                     await asyncio.sleep(1)
                     continue
