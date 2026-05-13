@@ -1016,6 +1016,7 @@ class AuthSessionManager:
                 "cllt": "fidoLogin",
                 "dllt": "generalLogin",
                 "lt": "",
+                "rememberMe": "true",
                 "execution": execution,
             }
             resp = await self._retry_request(
