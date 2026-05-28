@@ -550,7 +550,7 @@ class AuthSessionManager:
             )
             if resp.status_code in (301, 302, 307):
                 location = resp.headers.get("location", "")
-                if _is_cas_login_url(location):
+                if _is_auth_redirect(resp):
                     logger.info("event=cookie_restore result=session_expired")
                     await self._client.aclose()
                     self._client = None
@@ -1389,12 +1389,12 @@ class AuthSessionManager:
                 follow_redirects=False,
             )
 
-            # 只对明确的 CAS 重定向触发登录
+            # 只对明确的认证重定向触发登录
             if resp.status_code in (301, 302, 307):
                 location = resp.headers.get("location", "")
-                if _is_cas_login_url(location):
-                    logger.warning("event=keepalive result=cas_redirect location=%s", location[:80])
-                    self._transition(AuthState.EXPIRED, "keepalive:definitive_cas_redirect")
+                if _is_auth_redirect(resp):
+                    logger.warning("event=keepalive result=auth_redirect location=%s", location[:80])
+                    self._transition(AuthState.EXPIRED, "keepalive:auth_redirect")
                     try:
                         await self.ensure_login()
                     except (CircuitOpenError, UpstreamUnavailableError, CriticalLoginError):
