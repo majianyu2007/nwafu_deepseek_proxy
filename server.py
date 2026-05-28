@@ -202,6 +202,22 @@ def _is_streaming_path(path: str) -> bool:
     return any(path.startswith(p) for p in _STREAMING_PATH_PREFIXES)
 
 
+_STATIC_RESOURCE_SUFFIXES = (
+    ".map", ".css", ".js", ".woff2", ".woff", ".ttf", ".eot",
+    ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
+    ".woff2.map", ".js.map", ".css.map",
+)
+
+
+def _is_auth_irrelevant_path(path: str) -> bool:
+    """判断路径是否无需触发重新登录。
+
+    静态资源（.map, .css, .js, 图片等）的认证重定向不应触发完整的
+    CAS 重新登录流程，避免并发请求造成登录风暴。
+    """
+    return any(path.endswith(suffix) for suffix in _STATIC_RESOURCE_SUFFIXES)
+
+
 def _needs_long_timeout(path: str) -> bool:
     return _is_streaming_path(path)
 
@@ -1845,6 +1861,12 @@ async def _proxy_request(request: Request, target_path: str) -> Response:
             )
 
             if result is _AUTH_EXPIRED:
+                # 静态资源（.map, .css, .js 等）遇到认证重定向时，
+                # 不触发重新登录，直接返回 502。客户端刷新页面时会重新
+                # 通过完整页面请求完成认证。
+                if _is_auth_irrelevant_path(target_path):
+                    return _error_response(502, "静态资源认证过期，请刷新页面", error_type="static_auth_expired")
+
                 # 登录后立即被认证中间件拒绝时，抑制连续重登以保护账号。
                 if session_mgr.recent_login_rejected():
                     logger.warning(
