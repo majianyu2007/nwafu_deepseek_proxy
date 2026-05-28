@@ -943,9 +943,9 @@ class AuthSessionManager:
         """
         尝试 FIDO2/WebAuthn passkey 登录。成功返回 True。
 
-        FIDO2 登录分两步：
-        1. 在无 service 的登录页完成 passkey 认证，获取 TGC
-        2. 带着 TGC 访问目标 service，获取 ST ticket
+        FIDO2 登录在 Vouch + CAS OIDC 流程下：
+        1. 使用 _navigate_to_login_page 返回的登录页（含 OIDC service）完成 passkey 认证
+        2. 跟随重定向链完成 Vouch → deepseek 会话建立
         """
         if os.getenv("FIDO2_ENABLED", "").strip().lower() != "true":
             return False
@@ -970,14 +970,8 @@ class AuthSessionManager:
         logger.info("event=fido2_attempt")
 
         try:
-            # Step 1: 在无 service 的登录页完成 FIDO2 认证获取 TGC
-            # FIDO 表单 action 是 /authserver/login（无 service），
-            # 需要用同一个 context 下的 execution token
-            resp = await self._client.get(
-                f"{AUTH_SERVER}/authserver/login",
-                follow_redirects=False,
-            )
-            m = re.search(r'name="execution"[^>]*value="([^"]+)"', resp.text)
+            # 使用 Vouch 流程获取的登录页中的 execution token
+            m = re.search(r'name="execution"[^>]*value="([^"]+)"', login_page_html)
             if not m:
                 logger.warning("event=fido2_error detail=no_execution")
                 return False
@@ -1008,7 +1002,7 @@ class AuthSessionManager:
             )
             logger.info("event=fido2_assertion_built")
 
-            # Submit FIDO form (无 service 参数，与表单 action 一致)
+            # 提交 FIDO2 表单到 Vouch 流程获取的 login_url（含 OIDC service 参数）
             form = {
                 "username": base64.b64encode(USERNAME.encode()).decode(),
                 "responseJson": response_json,
@@ -1021,7 +1015,7 @@ class AuthSessionManager:
             }
             resp = await self._retry_request(
                 "POST",
-                f"{AUTH_SERVER}/authserver/login",
+                login_url,
                 data=form,
                 follow_redirects=False,
             )
@@ -1034,26 +1028,9 @@ class AuthSessionManager:
                                post_status, err_text or "unknown")
                 return False
 
-            # Follow redirects → TGC cookie set
+            # 跟随重定向链完成 Vouch → deepseek 会话建立
             location = resp.headers.get("location", "")
-            await self._follow_cas_redirect(location)
-
-            # Step 2: 带着 TGC 访问目标 service
-            service_url = (
-                f"{TARGET_BASE}/.auth/login/cas/callback"
-                f"?return_to={TARGET_BASE}/"
-            )
-            encoded_service = quote(service_url, safe="")
-            resp = await self._client.get(
-                f"{AUTH_SERVER}/authserver/login?service={encoded_service}",
-                follow_redirects=False,
-            )
-            if resp.status_code in (301, 302, 307, 308):
-                location = resp.headers.get("location", "")
-                await self._handle_login_redirect(location)
-            else:
-                logger.warning("event=fido2_service_redirect status=%d", resp.status_code)
-                return False
+            await self._handle_login_redirect(location)
 
             logger.info("event=fido2_login_success")
             return True
@@ -1061,6 +1038,30 @@ class AuthSessionManager:
         except Exception as e:
             logger.warning("event=fido2_login_error error=%s", e)
             return False
+
+    async def _navigate_to_login_page(self) -> tuple[str, "httpx.Response"]:
+        """通过 Vouch → CAS OIDC 链导航到实际 CAS 登录页。返回 (login_url, response)。"""
+        resp = await self._retry_request("GET", TARGET_BASE, follow_redirects=False)
+        if resp.status_code not in (301, 302, 307, 308):
+            raise RuntimeError(f"上游未返回预期的认证重定向 (status={resp.status_code})")
+
+        vouch_url = resp.headers.get("location", "")
+        if not vouch_url:
+            raise RuntimeError("上游重定向缺少 Location 头")
+        resp = await self._retry_request("GET", vouch_url, follow_redirects=False)
+        if resp.status_code not in (301, 302, 307, 308):
+            raise RuntimeError(f"Vouch 未返回预期的 OIDC 重定向 (status={resp.status_code})")
+
+        oidc_url = resp.headers.get("location", "")
+        resp = await self._retry_request("GET", oidc_url, follow_redirects=False)
+        if resp.status_code not in (301, 302, 307, 308):
+            raise RuntimeError(f"CAS OIDC 未返回预期的登录重定向 (status={resp.status_code})")
+
+        login_url = resp.headers.get("location", "")
+        logger.info("请求登录页：GET %s...", login_url[:80])
+        resp = await self._retry_request("GET", login_url, follow_redirects=False)
+
+        return login_url, resp
 
     async def _do_login(self):
         """执行完整的金智 AuthServer 登录流程。优先尝试 FIDO2 passkey 登录。"""
@@ -1075,15 +1076,8 @@ class AuthSessionManager:
         self._client = await self._create_client()
 
         try:
-            # Step 1: 获取登录页并提取表单参数
-            service_url = (
-                f"{TARGET_BASE}/.auth/login/cas/callback"
-                f"?return_to={TARGET_BASE}/"
-            )
-            encoded_service = quote(service_url, safe="")
-            login_url = f"{AUTH_SERVER}/authserver/login?service={encoded_service}"
-
-            resp = await self._fetch_login_page(login_url)
+            # Step 1: 通过 Vouch → CAS OIDC 链获取登录页
+            login_url, resp = await self._navigate_to_login_page()
 
             if resp.status_code in (301, 302, 307, 308):
                 location = resp.headers.get("location", "")
@@ -1166,7 +1160,7 @@ class AuthSessionManager:
             params = parse_qs(parsed.query)
             service_url = (
                 params.get("service", [None])[0]
-                or quote(f"{TARGET_BASE}/.auth/login/cas/callback?return_to={TARGET_BASE}/")
+                or quote(f"{TARGET_BASE}/")
             )
             await self._complete_2fa(service_url)
 
@@ -1491,6 +1485,25 @@ def _is_cas_login_url(url: str) -> bool:
     return False
 
 
+def _is_vouch_login_url(url: str) -> bool:
+    """检查 URL 是否是 Vouch Proxy 登录重定向（上游已切换到 Vouch + CAS OIDC 流程）。"""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.hostname == "vouch.nwafu.edu.cn" and parsed.path.startswith("/login")
+
+
+def _is_auth_redirect(resp: httpx.Response) -> bool:
+    """检查响应是否是认证重定向（CAS 登录页 或 Vouch Proxy）。"""
+    if resp.status_code not in (301, 302, 307):
+        return False
+    location = resp.headers.get("location", "")
+    return _is_cas_login_url(location) or _is_vouch_login_url(location)
+
+
 def _is_cas_login_redirect(resp: httpx.Response) -> bool:
     """检查响应是否是 CAS 登录页重定向（精确匹配 host）"""
     if resp.status_code not in (301, 302, 307):
@@ -1526,7 +1539,7 @@ async def _check_auth_failure(resp: httpx.Response, is_streaming: bool) -> bool:
     对流式响应：只检查重定向 URL（不读取 body）。
     """
     # 检查 302 重定向 URL
-    if _is_cas_login_redirect(resp):
+    if _is_auth_redirect(resp):
         logger.info("event=auth_detection result=definitive_cas state=redirect url=%s",
                      resp.headers.get("location", "")[:80])
         return True
@@ -2298,7 +2311,7 @@ def create_app(_settings: Settings, manager: AuthSessionManager) -> FastAPI:
 
                 if probe.status_code in (301, 302, 307):
                     location = probe.headers.get("location", "")
-                    if _is_cas_login_url(location):
+                    if _is_cas_login_url(location) or _is_vouch_login_url(location):
                         result["status"] = "unhealthy"
                         result["note"] = "会话已过期，需要重新登录"
                         result["latency_ms"] = latency_ms
