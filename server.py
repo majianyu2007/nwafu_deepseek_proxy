@@ -1057,7 +1057,14 @@ class AuthSessionManager:
 
     async def _navigate_to_login_page(self) -> tuple[str, "httpx.Response"]:
         """通过 Vouch → CAS OIDC 链导航到实际 CAS 登录页。返回 (login_url, response)。"""
-        resp = await self._retry_request("GET", TARGET_BASE, follow_redirects=False)
+        # 先尝试访问首页；如果首页不重定向（SPA 返回 200），则用 API 路径触发 Vouch
+        vouch_entry = TARGET_BASE
+        resp = await self._retry_request("GET", vouch_entry, follow_redirects=False)
+        if resp.status_code not in (301, 302, 307, 308):
+            # 首页没有重定向（Vouch 可能只保护 API 路径），改用 /api/config
+            logger.info("首页未重定向 (status=%d)，尝试 /api/config 触发 Vouch", resp.status_code)
+            vouch_entry = f"{TARGET_BASE}/api/config"
+            resp = await self._retry_request("GET", vouch_entry, follow_redirects=False)
         if resp.status_code not in (301, 302, 307, 308):
             raise RuntimeError(f"上游未返回预期的认证重定向 (status={resp.status_code})")
 
