@@ -1068,23 +1068,33 @@ class AuthSessionManager:
         if resp.status_code not in (301, 302, 307, 308):
             raise RuntimeError(f"上游未返回预期的认证重定向 (status={resp.status_code})")
 
-        vouch_url = resp.headers.get("location", "")
-        if not vouch_url:
-            raise RuntimeError("上游重定向缺少 Location 头")
-        resp = await self._retry_request("GET", vouch_url, follow_redirects=False)
-        if resp.status_code not in (301, 302, 307, 308):
-            raise RuntimeError(f"Vouch 未返回预期的 OIDC 重定向 (status={resp.status_code})")
+        # 动态跟随重定向链直到到达登录页（非重定向响应）
+        current_url = resp.headers.get('location', '')
+        if not current_url:
+            raise RuntimeError('上游重定向缺少 Location 头')
+        if not current_url.startswith('http'):
+            current_url = urljoin(str(resp.url), current_url)
 
-        oidc_url = resp.headers.get("location", "")
-        resp = await self._retry_request("GET", oidc_url, follow_redirects=False)
-        if resp.status_code not in (301, 302, 307, 308):
-            raise RuntimeError(f"CAS OIDC 未返回预期的登录重定向 (status={resp.status_code})")
+        max_hops = 10
+        for hop in range(max_hops):
+            resp = await self._retry_request('GET', current_url, follow_redirects=False)
+            if resp.status_code not in (301, 302, 307, 308):
+                # 到达最终页面（登录页）
+                break
+            next_url = resp.headers.get('location', '')
+            if not next_url:
+                raise RuntimeError(f'重定向链中缺少 Location 头 (hop={hop + 1})')
+            if not next_url.startswith('http'):
+                next_url = urljoin(str(resp.url), next_url)
+            current_url = next_url
+        else:
+            raise RuntimeError(f'重定向链过长（超过 {max_hops} 跳）')
 
-        login_url = resp.headers.get("location", "")
-        logger.info("请求登录页：GET %s...", login_url[:80])
-        resp = await self._retry_request("GET", login_url, follow_redirects=False)
+        login_url = str(current_url)
+        logger.info('到达登录页：%s (经过 %d 跳重定向)', login_url[:80], hop + 1)
 
         return login_url, resp
+
 
     async def _do_login(self):
         """执行完整的金智 AuthServer 登录流程。优先尝试 FIDO2 passkey 登录。"""
