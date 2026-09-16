@@ -16,3 +16,7 @@ __pycache__/
 
 *.md
 agent-transcripts/
+
+.data/
+.ruff_cache/
+tests/

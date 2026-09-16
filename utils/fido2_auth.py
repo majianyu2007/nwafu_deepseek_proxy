@@ -13,9 +13,9 @@ import json
 import os
 import struct
 
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.backends import default_backend
 
 
 def _b64url_decode(s: str) -> bytes:
@@ -61,7 +61,7 @@ def build_client_data(challenge_b64: str, rp_id: str, origin: str) -> tuple[byte
     return json_bytes, _sha256(json_bytes)
 
 
-def build_authenticator_data(rp_id: str, sign_count: int = 0, flags: int = 0x1d) -> bytes:
+def build_authenticator_data(rp_id: str, sign_count: int = 0, flags: int = 0x1D) -> bytes:
     """
     构造 authenticatorData。默认 flags=0x1d (UP|UV|BE|BS) 匹配浏览器 Bitwarden passkey。
     """
@@ -100,7 +100,7 @@ def build_webauthn_assertion(
     client_data_bytes, client_data_hash = build_client_data(challenge_b64, rp_id, origin)
 
     # 2. authenticatorData (flags: UP|UV|BE|BS = 0x1d, matching browser Bitwarden passkey)
-    auth_data = build_authenticator_data(rp_id, flags=0x1d)
+    auth_data = build_authenticator_data(rp_id, flags=0x1D)
 
     # 3. 签名 → DER 格式 (浏览器发送 ASN.1 DER，不转 raw RS)
     signed_data = auth_data + client_data_hash
@@ -150,7 +150,8 @@ def _der_to_raw(der_sig: bytes) -> bytes:
 # 从环境变量加载 credential
 # ============================================================
 
-def load_credential() -> dict | None:
+
+def load_credential(file_path: str | os.PathLike | None = None) -> dict | None:
     """
     从 FIDO2_CREDENTIAL 环境变量或 .data/fido2_credential.json 加载凭据。
     格式：{"credentialId": "...", "keyValue": "...", "rpId": "...", ...}
@@ -164,7 +165,9 @@ def load_credential() -> dict | None:
             pass
 
     # fallback 文件
-    file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".data", "fido2_credential.json")
+    file_path = file_path or os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), ".data", "fido2_credential.json"
+    )
     try:
         with open(file_path, "r") as f:
             return json.load(f)

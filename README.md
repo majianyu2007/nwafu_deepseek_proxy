@@ -1,5 +1,28 @@
 # nwafu_deepseek_proxy
 
+> **停止维护，准备归档（2026-09-16）**
+>
+> 本项目将在合并最后一次重构后归档，保留代码和文档供参考，不再继续适配上游变化。
+
+之前访问 `deepseek.nwafu.edu.cn` 的接口会被重定向到学校统一认证，第三方客户端没法直接完成登录，所以才有了这套代理：替客户端处理 CAS 登录、二次验证和会话维护。
+
+最近观察到，`/v1` 路径似乎已经不再触发这层认证重定向。如果你所在网络下可以直接调用接口，就不需要再绕一层本地代理了。这个项目也算完成使命了。
+
+可以先在客户端尝试以下配置：
+
+| 配置项 | 值 |
+|--------|----|
+| API Base | `https://deepseek.nwafu.edu.cn/v1` |
+| API Key | Open WebUI 中生成的真实 API Key |
+
+**直连时不能再用 `sk-local` 之类的占位 Key**，原先是代理替你注入真实 Key。不再重定向也不代表接口不需要 API Key，或已经开放校外访问；实际可用性仍以你所在网络和上游配置为准。这里记录的是目前观察到的变化，并不保证所有路径都取消了认证重定向。
+
+---
+
+## 历史文档
+
+以下保留项目原有功能、部署和实现说明，供已有部署或研究代码时参考，不代表仍在维护或保证适用于当前上游。
+
 西北农林科技大学 Open WebUI 透明反向代理。在本机完成金智教育（Wisedu）CAS 认证，维护上游会话 Cookie，所有请求转发到 `deepseek.nwafu.edu.cn`。
 
 `main` 分支是 Python/FastAPI 实现，`rust-rewrite` 分支是 Rust/Axum 重写版。
@@ -8,7 +31,7 @@
 
 - `http://localhost:8000/` 直接就是 Open WebUI，走代理认证过的会话。
 - `http://localhost:8000/v1` 作为 OpenAI API Base，兼容各种第三方客户端。
-- 客户端 API Key 任意占位值即可，代理会自动注入 `.env` 中配置的真实 Key。
+- 客户端 API Key 任意占位值即可，代理为 `/v1/`、`/openai/`、`/ollama/` 请求注入 `.env` 中配置的真实 Key；浏览器 `/api/*` 使用会话身份。
 - 自动完成 CAS 登录、TOTP 二次验证、ST ticket 兑换、Cookie 保活。
 - 支持 passkey (FIDO2/WebAuthn) 登录，可绕过滑块验证码。
 - 登录后的 Cookie 持久化到 `.data/cookies.json`，重启时自动恢复，避免每次重启重登。
@@ -20,7 +43,7 @@
 
 ### 1. 环境
 
-Python 3.9+，能访问 `authserver.nwafu.edu.cn` 和 `deepseek.nwafu.edu.cn`（校园网或 VPN）。
+Python 3.10+（推荐 3.12），能访问 `authserver.nwafu.edu.cn` 和 `deepseek.nwafu.edu.cn`（校园网或 VPN）。
 
 ### 2. 安装
 
@@ -121,7 +144,7 @@ https://deepseek.nwafu.edu.cn
 
 密码或 passkey 登录成功后，CAS 会话 Cookie 自动保存到 `.data/cookies.json`。重启时先试恢复，有效就零次登录，无效才走完整登录。
 
-Docker 每天重启也没有额外开销，搭配 CAS 的 `rememberMe`（7天免登录），每天最多登录一次。
+重启会优先恢复已有 Cookie；实际有效期由学校认证服务决定。重启不会清除登录频率限制或仍在生效的熔断。
 
 如果已在其他设备的浏览器上登录过，可以将 Cookie 导出到本机使用：
 
@@ -222,6 +245,17 @@ WEBHOOK_URLS=
 **localhost HTTPS 报错**
 
 清掉 `localhost` 的浏览器站点数据，或者换 `http://127.0.0.1:8000`。
+
+## 开发与维护
+
+运行时代码已按配置、认证协议、会话保护、HTTP/SSE、WebSocket、页面路由和模型监控拆分到 `nwafu_proxy/`。`python server.py` 和 Docker 启动方式保持不变。
+
+```bash
+pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+```
+
+测试不需要真实账号或校园网。模块分工、兼容性和行为调整见 [架构与维护说明](docs/architecture.md)。
 
 ## License
 
