@@ -1,105 +1,38 @@
-# NWAFU DeepSeek Proxy - Agent Instructions
+# NWAFU DeepSeek Proxy — Agent Instructions
 
-## Project Type
-Python FastAPI transparent reverse proxy that bypasses Wisedu CAS authentication for NWAFU's Open WebUI instance. All requests are forwarded to the upstream as-is; the proxy only handles CAS session management and header injection.
+## Scope and entry points
 
-## Core Commands
+Python/FastAPI reverse proxy for NWAFU Open WebUI. `main` is the Python implementation; `rust-rewrite` is separate. Preserve existing upstream HTTP, SSE and WebSocket behavior when editing.
 
-**Start server:**
-```bash
-python server.py
-```
+- Run: `python server.py` or `python -m nwafu_proxy`
+- Factory: `nwafu_proxy.app.create_app(settings, manager)`
+- Docker: `docker compose up -d`
+- Offline tests: `python -m unittest discover -s tests -v`
+- Lint: `ruff check nwafu_proxy server.py tests utils/model_monitor.py utils/fido2_auth.py`
+- Format: `ruff format --check nwafu_proxy server.py tests utils/model_monitor.py utils/fido2_auth.py`
+- Install runtime: `pip install -r requirements.txt`; development: `pip install -r requirements-dev.txt`
+- Manual campus smoke tests: `python utils/list_models.py`, `python utils/test_api.py [model]`
 
-**Docker deployment:**
-```bash
-docker compose up -d    # Start
-docker compose down     # Stop
-```
+See `docs/architecture.md` for module responsibilities and compatibility details. Keep runtime code in `nwafu_proxy/`; keep `server.py` as a small compatibility entry point. Avoid import-time environment loading, authentication and global session instances. Pass Settings and AuthSessionManager explicitly. Register local routes before proxy catch-all.
 
-**Verify models:**
-```bash
-python utils/list_models.py
-```
+## Configuration
 
-**Test API endpoint:**
-```bash
-python utils/test_api.py                  # Auto-select first chat model
-python utils/test_api.py Qwen3-235B-A22B  # Specific model
-```
+Copy `.env.example` to `.env`. Required: `NWAFU_USERNAME`, `NWAFU_PASSWORD`; API access uses `OPENWEBUI_API_KEY`. Optional TOTP, FIDO2 and monitoring options are described in README. Never commit credentials, exported vaults, cookies, or `.data/*.json`.
 
-## Environment Setup
+Default persistent data stays at root `.data/`. Tests use temporary directories and mocked HTTP transports; never require real campus credentials or authenticate during ordinary unit tests. Campus end-to-end checks require connectivity to the configured target and university authentication services.
 
-1. Copy config template:
-   ```bash
-   cp .env.example .env
-   ```
+## Account protection invariants
 
-2. Required env vars in `.env`:
-   - `NWAFU_USERNAME` - Student ID
-   - `NWAFU_PASSWORD` - Auth password (wrap in quotes if contains `#`)
-   - `OPENWEBUI_API_KEY` - From Open WebUI Settings / Account / API Keys
+- `OK`: valid session; `SUSPECT`: ambiguous upstream/network issue; `EXPIRED`: confirmed authentication failure; `LOGIN_BACKOFF` / `CIRCUIT_OPEN`: protected waiting periods.
+- Only confirmed authentication redirects/login forms may trigger recovery. Network errors and ordinary upstream errors must not cause login storms.
+- Preserve the login lock, hourly rate limit, minimum login interval, exponential backoff and failure-specific circuit durations.
+- Cookie restoration shares the login lock. Service restart must not erase login limits or active circuits.
+- `force_relogin` has one runtime call site, in HTTP proxy authentication recovery, and must honor all active protection windows.
+- Health checks and model monitoring never call `ensure_login` or `force_relogin`. Monitoring uses the existing client only in OK state.
+- Keepalive may recover confirmed authentication expiry through `ensure_login`, but never calls `force_relogin`; network failures only mark SUSPECT and never clear a circuit/backoff.
+- Streaming auth checks do not consume response bodies. Browser `/api/*` requests retain cookie-based identity; real API-key injection is limited to `/v1/`, `/openai/`, `/ollama/`.
+- Preserve cancellation and cleanup for HTTP streams, WebSocket relay tasks, monitoring and keepalive.
 
-3. Optional:
-   - `TOTP_SECRET` - TOTP authenticator secret (Base32) for auto-completing 2FA (required since 2026-05-12)
-   - `MONITOR_ENABLED=true` - Enable model change monitoring
-   - `MONITOR_POLL_INTERVAL` - Poll interval in seconds (default 600, min 300)
+## Change discipline
 
-4. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Architecture Facts
-
-**Entry points:**
-- `server.py` - Main FastAPI application (~1300 lines, full reverse proxy)
-- `utils/model_monitor.py` - Optional model change monitor (enabled via `MONITOR_ENABLED=true`)
-- `utils/list_models.py` - Model listing utility
-- `utils/test_api.py` - End-to-end connectivity test
-
-**Core flow:**
-1. Client -> `localhost:8000/*` -> FastAPI proxy
-2. Proxy authenticates via CAS (AES-CBC password encryption + TOTP 2FA)
-3. Transparently forwards ALL requests to `deepseek.nwafu.edu.cn` with valid session cookie + Bearer token
-4. Visiting `localhost:8000/` shows the full Open WebUI interface
-
-**Auth state machine (replaces old `_login_ok` bool):**
-- `OK` — Session valid, normal operation
-- `SUSPECT` — Anomaly detected (network error, upstream issue), does NOT trigger login
-- `EXPIRED` — Definitive CAS redirect confirmed, needs re-login
-- `LOGIN_BACKOFF` — Consecutive failures, waiting with exponential backoff
-- `CIRCUIT_OPEN` — Too many failures, account protection active (15 min – 6 hours)
-
-Only a definitive CAS login page redirect (exact host `authserver.nwafu.edu.cn`) can trigger re-login. All other errors → SUSPECT.
-
-**Login safety layers:**
-1. Failure classification (account lock → 6h circuit, captcha → 2h, password error → 1h)
-2. Circuit breaker (3 consecutive failures → CIRCUIT_OPEN)
-3. Exponential backoff (5s → 20s → 80s → 5min → 15min, with jitter)
-4. Rate limiting (max 6 logins/hour, persisted to `.data/login_state.json`)
-5. Single-flight lock (at most 1 real CAS login across concurrent requests)
-
-**Model monitor (optional):**
-- Only polls when auth state is OK
-- Never triggers CAS login
-- Notifies via Telegram / Webhook / SSE
-- Dashboard at `/monitor`
-
-## Dependencies (requirements.txt)
-- fastapi, uvicorn, httpx - Core HTTP/server
-- pycryptodome - AES encryption
-- python-dotenv - Environment loading
-- pyotp - TOTP code generation for 2FA
-- HTML parsing for CAS login uses stdlib regex only
-
-## Testing Notes
-- API Key in requests can be arbitrary value (e.g., `sk-any`) - proxy replaces with real key
-- Stream responses use 5-minute timeout; non-stream use 60-second timeout
-- Visit `http://localhost:8000/health` for health check (includes auth_state field)
-
-## Network Requirements
-Must be able to reach:
-- `authserver.nwafu.edu.cn` - CAS authentication
-- `deepseek.nwafu.edu.cn` - Target Open WebUI instance
-
-Requires campus network or VPN.
+Cover meaningful auth, routing and streaming changes with offline regression tests. Update Docker COPY entries if runtime assets move. Update architecture documentation when module boundaries or compatibility change. Do not claim campus integration works based only on mocked tests.

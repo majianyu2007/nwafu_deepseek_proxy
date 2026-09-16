@@ -30,3 +30,6 @@ cas-recording-*.json
 # CAS 调试/抓包页面
 *_login*.html
 *_page_debug*.html
+
+# Local lint cache
+.ruff_cache/
